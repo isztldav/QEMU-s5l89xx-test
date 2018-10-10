@@ -256,7 +256,7 @@ int pci_find_domain(const PCIBus *bus)
 }
 
 void pci_bus_new_inplace(PCIBus *bus, DeviceState *parent,
-                         const char *name, int devfn_min)
+                         const char *name, uint8_t devfn_min)
 {
     qbus_create_inplace(&bus->qbus, &pci_bus_info, parent, name);
     assert(PCI_FUNC(devfn_min) == 0);
@@ -269,7 +269,7 @@ void pci_bus_new_inplace(PCIBus *bus, DeviceState *parent,
     vmstate_register(NULL, -1, &vmstate_pcibus, bus);
 }
 
-PCIBus *pci_bus_new(DeviceState *parent, const char *name, int devfn_min)
+PCIBus *pci_bus_new(DeviceState *parent, const char *name, uint8_t devfn_min)
 {
     PCIBus *bus;
 
@@ -303,7 +303,7 @@ void pci_bus_set_mem_base(PCIBus *bus, target_phys_addr_t base)
 
 PCIBus *pci_register_bus(DeviceState *parent, const char *name,
                          pci_set_irq_fn set_irq, pci_map_irq_fn map_irq,
-                         void *irq_opaque, int devfn_min, int nirq)
+                         void *irq_opaque, uint8_t devfn_min, int nirq)
 {
     PCIBus *bus;
 
@@ -558,7 +558,7 @@ PCIBus *pci_get_bus_devfn(int *devfnp, const char *devaddr)
         return NULL;
     }
 
-    *devfnp = slot << 3;
+    *devfnp = PCI_DEVFN(slot, 0);
     return pci_find_bus(pci_find_root_bus(dom), bus);
 }
 
@@ -1603,14 +1603,14 @@ PCIBus *pci_find_bus(PCIBus *bus, int bus_num)
     return NULL;
 }
 
-PCIDevice *pci_find_device(PCIBus *bus, int bus_num, int slot, int function)
+PCIDevice *pci_find_device(PCIBus *bus, int bus_num, uint8_t devfn)
 {
     bus = pci_find_bus(bus, bus_num);
 
     if (!bus)
         return NULL;
 
-    return bus->devices[PCI_DEVFN(slot, function)];
+    return bus->devices[devfn];
 }
 
 static int pci_qdev_init(DeviceState *qdev, DeviceInfo *base)
@@ -1708,6 +1708,21 @@ PCIDevice *pci_create_multifunction(PCIBus *bus, int devfn, bool multifunction,
     return DO_UPCAST(PCIDevice, qdev, dev);
 }
 
+PCIDevice *pci_try_create_multifunction(PCIBus *bus, int devfn,
+                                        bool multifunction,
+                                        const char *name)
+{
+    DeviceState *dev;
+
+    dev = qdev_try_create(&bus->qbus, name);
+    if (!dev) {
+        return NULL;
+    }
+    qdev_prop_set_uint32(dev, "addr", devfn);
+    qdev_prop_set_bit(dev, "multifunction", multifunction);
+    return DO_UPCAST(PCIDevice, qdev, dev);
+}
+
 PCIDevice *pci_create_simple_multifunction(PCIBus *bus, int devfn,
                                            bool multifunction,
                                            const char *name)
@@ -1725,6 +1740,11 @@ PCIDevice *pci_create(PCIBus *bus, int devfn, const char *name)
 PCIDevice *pci_create_simple(PCIBus *bus, int devfn, const char *name)
 {
     return pci_create_simple_multifunction(bus, devfn, false, name);
+}
+
+PCIDevice *pci_try_create(PCIBus *bus, int devfn, const char *name)
+{
+    return pci_try_create_multifunction(bus, devfn, false, name);
 }
 
 static int pci_find_space(PCIDevice *pdev, uint8_t size)
@@ -1855,6 +1875,7 @@ static int pci_add_option_rom(PCIDevice *pdev, bool is_default_rom)
     if (size < 0) {
         error_report("%s: failed to find romfile \"%s\"",
                      __FUNCTION__, pdev->romfile);
+        qemu_free(path);
         return -1;
     }
     if (size & (size - 1)) {

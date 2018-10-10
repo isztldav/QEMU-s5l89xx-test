@@ -32,19 +32,6 @@ static inline int cpu_has_work(CPUState *env)
     return (env->interrupt_request & (CPU_INTERRUPT_HARD | CPU_INTERRUPT_NMI));
 }
 
-static inline int cpu_halted(CPUState *env) {
-	if (!env->halted)
-		return 0;
-
-	/* IRQ, NMI and GURU execeptions wakes us up.  */
-	if (env->interrupt_request
-	    & (CPU_INTERRUPT_HARD | CPU_INTERRUPT_NMI)) {
-		env->halted = 0;
-		return 0;
-	}
-	return EXCP_HALTED;
-}
-
 static inline void cpu_pc_from_tb(CPUState *env, TranslationBlock *tb)
 {
     env->sregs[SR_PC] = tb->pc;

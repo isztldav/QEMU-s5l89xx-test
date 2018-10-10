@@ -169,17 +169,15 @@ int kvm_arch_remove_sw_breakpoint(CPUState *env, struct kvm_sw_breakpoint *bp)
     return 0;
 }
 
-int kvm_arch_pre_run(CPUState *env, struct kvm_run *run)
+void kvm_arch_pre_run(CPUState *env, struct kvm_run *run)
 {
-    return 0;
 }
 
-int kvm_arch_post_run(CPUState *env, struct kvm_run *run)
+void kvm_arch_post_run(CPUState *env, struct kvm_run *run)
 {
-    return 0;
 }
 
-int kvm_arch_process_irqchip_events(CPUState *env)
+int kvm_arch_process_async_events(CPUState *env)
 {
     return 0;
 }
@@ -196,6 +194,7 @@ static void kvm_s390_interrupt_internal(CPUState *env, int type, uint32_t parm,
 
     env->halted = 0;
     env->exception_index = -1;
+    qemu_cpu_kick(env);
 
     kvmint.type = type;
     kvmint.parm = parm;
@@ -442,7 +441,7 @@ static int handle_instruction(CPUState *env, struct kvm_run *run)
     if (r < 0) {
         enter_pgmcheck(env, 0x0001);
     }
-    return r;
+    return 0;
 }
 
 static int handle_intercept(CPUState *env)
@@ -498,10 +497,25 @@ int kvm_arch_handle_exit(CPUState *env, struct kvm_run *run)
             break;
     }
 
+    if (ret == 0) {
+        ret = EXCP_INTERRUPT;
+    } else if (ret > 0) {
+        ret = 0;
+    }
     return ret;
 }
 
 bool kvm_arch_stop_on_emulation_error(CPUState *env)
 {
     return true;
+}
+
+int kvm_arch_on_sigbus_vcpu(CPUState *env, int code, void *addr)
+{
+    return 1;
+}
+
+int kvm_arch_on_sigbus(int code, void *addr)
+{
+    return 1;
 }

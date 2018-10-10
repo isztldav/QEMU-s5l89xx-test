@@ -36,6 +36,7 @@
 #include "qemu-common.h"
 #include "qemu_socket.h"
 #include "hw/qdev.h"
+#include "iov.h"
 
 static QTAILQ_HEAD(, VLANState) vlans;
 static QTAILQ_HEAD(, VLANClientState) non_vlan_clients;
@@ -91,47 +92,6 @@ static int get_str_sep(char *buf, int buf_size, const char **pp, int sep)
     }
     *pp = p1;
     return 0;
-}
-
-int parse_host_src_port(struct sockaddr_in *haddr,
-                        struct sockaddr_in *saddr,
-                        const char *input_str)
-{
-    char *str = qemu_strdup(input_str);
-    char *host_str = str;
-    char *src_str;
-    const char *src_str2;
-    char *ptr;
-
-    /*
-     * Chop off any extra arguments at the end of the string which
-     * would start with a comma, then fill in the src port information
-     * if it was provided else use the "any address" and "any port".
-     */
-    if ((ptr = strchr(str,',')))
-        *ptr = '\0';
-
-    if ((src_str = strchr(input_str,'@'))) {
-        *src_str = '\0';
-        src_str++;
-    }
-
-    if (parse_host_port(haddr, host_str) < 0)
-        goto fail;
-
-    src_str2 = src_str;
-    if (!src_str || *src_str == '\0')
-        src_str2 = ":0";
-
-    if (parse_host_port(saddr, src_str2) < 0)
-        goto fail;
-
-    free(str);
-    return(0);
-
-fail:
-    free(str);
-    return -1;
 }
 
 int parse_host_port(struct sockaddr_in *saddr, const char *str)
@@ -411,11 +371,11 @@ int qemu_can_send_packet(VLANClientState *sender)
         }
 
         /* no can_receive() handler, they can always receive */
-        if (!vc->info->can_receive || vc->info->can_receive(vc)) {
-            return 1;
+        if (vc->info->can_receive && !vc->info->can_receive(vc)) {
+            return 0;
         }
     }
-    return 0;
+    return 1;
 }
 
 static ssize_t qemu_deliver_packet(VLANClientState *sender,
@@ -572,28 +532,11 @@ static ssize_t vc_sendv_compat(VLANClientState *vc, const struct iovec *iov,
                                int iovcnt)
 {
     uint8_t buffer[4096];
-    size_t offset = 0;
-    int i;
+    size_t offset;
 
-    for (i = 0; i < iovcnt; i++) {
-        size_t len;
-
-        len = MIN(sizeof(buffer) - offset, iov[i].iov_len);
-        memcpy(buffer + offset, iov[i].iov_base, len);
-        offset += len;
-    }
+    offset = iov_to_buf(iov, iovcnt, buffer, 0, sizeof(buffer));
 
     return vc->info->receive(vc, buffer, offset);
-}
-
-static ssize_t calc_iov_length(const struct iovec *iov, int iovcnt)
-{
-    size_t offset = 0;
-    int i;
-
-    for (i = 0; i < iovcnt; i++)
-        offset += iov[i].iov_len;
-    return offset;
 }
 
 static ssize_t qemu_deliver_packet_iov(VLANClientState *sender,
@@ -605,7 +548,7 @@ static ssize_t qemu_deliver_packet_iov(VLANClientState *sender,
     VLANClientState *vc = opaque;
 
     if (vc->link_down) {
-        return calc_iov_length(iov, iovcnt);
+        return iov_size(iov, iovcnt);
     }
 
     if (vc->info->receive_iov) {
@@ -633,7 +576,7 @@ static ssize_t qemu_vlan_deliver_packet_iov(VLANClientState *sender,
         }
 
         if (vc->link_down) {
-            ret = calc_iov_length(iov, iovcnt);
+            ret = iov_size(iov, iovcnt);
             continue;
         }
 
@@ -658,7 +601,7 @@ ssize_t qemu_sendv_packet_async(VLANClientState *sender,
     NetQueue *queue;
 
     if (sender->link_down || (!sender->peer && !sender->vlan)) {
-        return calc_iov_length(iov, iovcnt);
+        return iov_size(iov, iovcnt);
     }
 
     if (sender->peer) {
@@ -1025,7 +968,11 @@ static const struct {
                 .name = "vhostfd",
                 .type = QEMU_OPT_STRING,
                 .help = "file descriptor of an already opened vhost net device",
-            },
+            }, {
+                .name = "vhostforce",
+                .type = QEMU_OPT_BOOL,
+                .help = "force vhost on for non-MSIX virtio guests",
+        },
 #endif /* _WIN32 */
             { /* end of list */ }
         },
@@ -1324,6 +1271,17 @@ done:
     if (vc->info->link_status_changed) {
         vc->info->link_status_changed(vc);
     }
+
+    /* Notify peer. Don't update peer link status: this makes it possible to
+     * disconnect from host network without notifying the guest.
+     * FIXME: is disconnected link status change operation useful?
+     *
+     * Current behaviour is compatible with qemu vlans where there could be
+     * multiple clients that can still communicate with each other in
+     * disconnected mode. For now maintain this compatibility. */
+    if (vc->peer && vc->peer->info->link_status_changed) {
+        vc->peer->info->link_status_changed(vc->peer);
+    }
     return 0;
 }
 
@@ -1347,12 +1305,30 @@ void net_check_clients(void)
 {
     VLANState *vlan;
     VLANClientState *vc;
-    int has_nic = 0, has_host_dev = 0;
+    int seen_nics = 0;
+
+    /* Don't warn about the default network setup that you get if
+     * no command line -net options are specified. There are two
+     * cases that we would otherwise complain about:
+     * (1) board doesn't support a NIC but the implicit "-net nic"
+     * requested one; we'd otherwise complain about more NICs being
+     * specified than we support, and also that the vlan set up by
+     * the implicit "-net user" didn't have any NICs connected to it
+     * (2) CONFIG_SLIRP not set: we'd otherwise complain about the
+     * implicit "-net nic" setting up a nic that wasn't connected to
+     * anything.
+     */
+    if (default_net) {
+        return;
+    }
 
     QTAILQ_FOREACH(vlan, &vlans, next) {
+        int has_nic = 0, has_host_dev = 0;
+
         QTAILQ_FOREACH(vc, &vlan->clients, next) {
             switch (vc->info->type) {
             case NET_CLIENT_TYPE_NIC:
+                seen_nics++;
                 has_nic = 1;
                 break;
             case NET_CLIENT_TYPE_SLIRP:
@@ -1372,11 +1348,25 @@ void net_check_clients(void)
                     vlan->id);
     }
     QTAILQ_FOREACH(vc, &non_vlan_clients, next) {
+        if (vc->info->type == NET_CLIENT_TYPE_NIC) {
+            seen_nics++;
+        }
         if (!vc->peer) {
             fprintf(stderr, "Warning: %s %s has no peer\n",
                     vc->info->type == NET_CLIENT_TYPE_NIC ? "nic" : "netdev",
                     vc->name);
         }
+    }
+    if (seen_nics != nb_nics) {
+        /* Number of NICs requested by user on command line doesn't match
+         * the number the model actually registered with us.
+         * This will generally only happen for models of embedded boards
+         * with no PCI bus or similar. PCI based machines can instantiate
+         * all requested NICs as PCI devices but usually embedded boards
+         * only have a single NIC.
+         */
+        fprintf(stderr, "Warning: more nics requested than this machine "
+                "supports; some have been ignored\n");
     }
 }
 

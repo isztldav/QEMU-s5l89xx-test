@@ -923,7 +923,7 @@ static void dec_load(DisasContext *dc)
     /*
      * When doing reverse accesses we need to do two things.
      *
-     * 1. Reverse the address wrt endianess.
+     * 1. Reverse the address wrt endianness.
      * 2. Byteswap the data lanes on the way back into the CPU core.
      */
     if (rev && size != 4) {
@@ -1715,9 +1715,13 @@ gen_intermediate_code_internal(CPUState *env, TranslationBlock *tb,
     t_sync_flags(dc);
 
     if (unlikely(env->singlestep_enabled)) {
-        t_gen_raise_exception(dc, EXCP_DEBUG);
-        if (dc->is_jmp == DISAS_NEXT)
+        TCGv_i32 tmp = tcg_const_i32(EXCP_DEBUG);
+
+        if (dc->is_jmp != DISAS_JUMP) {
             tcg_gen_movi_tl(cpu_SR[SR_PC], npc);
+        }
+        gen_helper_raise_exception(tmp);
+        tcg_temp_free_i32(tmp);
     } else {
         switch(dc->is_jmp) {
             case DISAS_NEXT:

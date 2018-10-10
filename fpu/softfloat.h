@@ -1,3 +1,9 @@
+/*
+ * QEMU float support
+ *
+ * Derived from SoftFloat.
+ */
+
 /*============================================================================
 
 This C header file is part of the SoftFloat IEC/IEEE Floating-point Arithmetic
@@ -59,23 +65,14 @@ typedef signed int int32;
 typedef uint64_t uint64;
 typedef int64_t int64;
 
-/*----------------------------------------------------------------------------
-| Each of the following `typedef's defines a type that holds integers
-| of _exactly_ the number of bits specified.  For instance, for most
-| implementation of C, `bits16' and `sbits16' should be `typedef'ed to
-| `unsigned short int' and `signed short int' (or `short int'), respectively.
-*----------------------------------------------------------------------------*/
-typedef uint8_t bits8;
-typedef int8_t sbits8;
-typedef uint16_t bits16;
-typedef int16_t sbits16;
-typedef uint32_t bits32;
-typedef int32_t sbits32;
-typedef uint64_t bits64;
-typedef int64_t sbits64;
-
 #define LIT64( a ) a##LL
 #define INLINE static inline
+
+#if defined(TARGET_MIPS) || defined(TARGET_SH4)
+#define SNAN_BIT_IS_ONE		1
+#else
+#define SNAN_BIT_IS_ONE		0
+#endif
 
 /*----------------------------------------------------------------------------
 | The macro `FLOATX80' must be defined to enable the extended double-precision
@@ -120,23 +117,37 @@ enum {
 //#define USE_SOFTFLOAT_STRUCT_TYPES
 #ifdef USE_SOFTFLOAT_STRUCT_TYPES
 typedef struct {
+    uint16_t v;
+} float16;
+#define float16_val(x) (((float16)(x)).v)
+#define make_float16(x) __extension__ ({ float16 f16_val = {x}; f16_val; })
+#define const_float16(x) { x }
+typedef struct {
     uint32_t v;
 } float32;
 /* The cast ensures an error if the wrong type is passed.  */
 #define float32_val(x) (((float32)(x)).v)
 #define make_float32(x) __extension__ ({ float32 f32_val = {x}; f32_val; })
+#define const_float32(x) { x }
 typedef struct {
     uint64_t v;
 } float64;
 #define float64_val(x) (((float64)(x)).v)
 #define make_float64(x) __extension__ ({ float64 f64_val = {x}; f64_val; })
+#define const_float64(x) { x }
 #else
+typedef uint16_t float16;
 typedef uint32_t float32;
 typedef uint64_t float64;
+#define float16_val(x) (x)
 #define float32_val(x) (x)
 #define float64_val(x) (x)
+#define make_float16(x) (x)
 #define make_float32(x) (x)
 #define make_float64(x) (x)
+#define const_float16(x) (x)
+#define const_float32(x) (x)
+#define const_float64(x) (x)
 #endif
 #ifdef FLOATX80
 typedef struct {
@@ -229,44 +240,62 @@ void float_raise( int8 flags STATUS_PARAM);
 /*----------------------------------------------------------------------------
 | Software IEC/IEEE integer-to-floating-point conversion routines.
 *----------------------------------------------------------------------------*/
-float32 int32_to_float32( int STATUS_PARAM );
-float64 int32_to_float64( int STATUS_PARAM );
+float32 int32_to_float32( int32 STATUS_PARAM );
+float64 int32_to_float64( int32 STATUS_PARAM );
 float32 uint32_to_float32( unsigned int STATUS_PARAM );
 float64 uint32_to_float64( unsigned int STATUS_PARAM );
 #ifdef FLOATX80
-floatx80 int32_to_floatx80( int STATUS_PARAM );
+floatx80 int32_to_floatx80( int32 STATUS_PARAM );
 #endif
 #ifdef FLOAT128
-float128 int32_to_float128( int STATUS_PARAM );
+float128 int32_to_float128( int32 STATUS_PARAM );
 #endif
-float32 int64_to_float32( int64_t STATUS_PARAM );
-float32 uint64_to_float32( uint64_t STATUS_PARAM );
-float64 int64_to_float64( int64_t STATUS_PARAM );
-float64 uint64_to_float64( uint64_t STATUS_PARAM );
+float32 int64_to_float32( int64 STATUS_PARAM );
+float32 uint64_to_float32( uint64 STATUS_PARAM );
+float64 int64_to_float64( int64 STATUS_PARAM );
+float64 uint64_to_float64( uint64 STATUS_PARAM );
 #ifdef FLOATX80
-floatx80 int64_to_floatx80( int64_t STATUS_PARAM );
+floatx80 int64_to_floatx80( int64 STATUS_PARAM );
 #endif
 #ifdef FLOAT128
-float128 int64_to_float128( int64_t STATUS_PARAM );
+float128 int64_to_float128( int64 STATUS_PARAM );
 #endif
 
 /*----------------------------------------------------------------------------
 | Software half-precision conversion routines.
 *----------------------------------------------------------------------------*/
-bits16 float32_to_float16( float32, flag STATUS_PARAM );
-float32 float16_to_float32( bits16, flag STATUS_PARAM );
+float16 float32_to_float16( float32, flag STATUS_PARAM );
+float32 float16_to_float32( float16, flag STATUS_PARAM );
+
+/*----------------------------------------------------------------------------
+| Software half-precision operations.
+*----------------------------------------------------------------------------*/
+int float16_is_quiet_nan( float16 );
+int float16_is_signaling_nan( float16 );
+float16 float16_maybe_silence_nan( float16 );
+
+/*----------------------------------------------------------------------------
+| The pattern for a default generated half-precision NaN.
+*----------------------------------------------------------------------------*/
+#if defined(TARGET_ARM)
+#define float16_default_nan make_float16(0x7E00)
+#elif SNAN_BIT_IS_ONE
+#define float16_default_nan make_float16(0x7DFF)
+#else
+#define float16_default_nan make_float16(0xFE00)
+#endif
 
 /*----------------------------------------------------------------------------
 | Software IEC/IEEE single-precision conversion routines.
 *----------------------------------------------------------------------------*/
-int float32_to_int16_round_to_zero( float32 STATUS_PARAM );
+int16 float32_to_int16_round_to_zero( float32 STATUS_PARAM );
 unsigned int float32_to_uint16_round_to_zero( float32 STATUS_PARAM );
-int float32_to_int32( float32 STATUS_PARAM );
-int float32_to_int32_round_to_zero( float32 STATUS_PARAM );
-unsigned int float32_to_uint32( float32 STATUS_PARAM );
-unsigned int float32_to_uint32_round_to_zero( float32 STATUS_PARAM );
-int64_t float32_to_int64( float32 STATUS_PARAM );
-int64_t float32_to_int64_round_to_zero( float32 STATUS_PARAM );
+int32 float32_to_int32( float32 STATUS_PARAM );
+int32 float32_to_int32_round_to_zero( float32 STATUS_PARAM );
+uint32 float32_to_uint32( float32 STATUS_PARAM );
+uint32 float32_to_uint32_round_to_zero( float32 STATUS_PARAM );
+int64 float32_to_int64( float32 STATUS_PARAM );
+int64 float32_to_int64_round_to_zero( float32 STATUS_PARAM );
 float64 float32_to_float64( float32 STATUS_PARAM );
 #ifdef FLOATX80
 floatx80 float32_to_floatx80( float32 STATUS_PARAM );
@@ -295,6 +324,8 @@ int float32_le_quiet( float32, float32 STATUS_PARAM );
 int float32_lt_quiet( float32, float32 STATUS_PARAM );
 int float32_compare( float32, float32 STATUS_PARAM );
 int float32_compare_quiet( float32, float32 STATUS_PARAM );
+float32 float32_min(float32, float32 STATUS_PARAM);
+float32 float32_max(float32, float32 STATUS_PARAM);
 int float32_is_quiet_nan( float32 );
 int float32_is_signaling_nan( float32 );
 float32 float32_maybe_silence_nan( float32 );
@@ -341,23 +372,44 @@ INLINE int float32_is_zero_or_denormal(float32 a)
     return (float32_val(a) & 0x7f800000) == 0;
 }
 
+INLINE float32 float32_set_sign(float32 a, int sign)
+{
+    return make_float32((float32_val(a) & 0x7fffffff) | (sign << 31));
+}
+
 #define float32_zero make_float32(0)
 #define float32_one make_float32(0x3f800000)
 #define float32_ln2 make_float32(0x3f317218)
+#define float32_half make_float32(0x3f000000)
+#define float32_infinity make_float32(0x7f800000)
+
+
+/*----------------------------------------------------------------------------
+| The pattern for a default generated single-precision NaN.
+*----------------------------------------------------------------------------*/
+#if defined(TARGET_SPARC)
+#define float32_default_nan make_float32(0x7FFFFFFF)
+#elif defined(TARGET_PPC) || defined(TARGET_ARM) || defined(TARGET_ALPHA)
+#define float32_default_nan make_float32(0x7FC00000)
+#elif SNAN_BIT_IS_ONE
+#define float32_default_nan make_float32(0x7FBFFFFF)
+#else
+#define float32_default_nan make_float32(0xFFC00000)
+#endif
 
 /*----------------------------------------------------------------------------
 | Software IEC/IEEE double-precision conversion routines.
 *----------------------------------------------------------------------------*/
-int float64_to_int16_round_to_zero( float64 STATUS_PARAM );
+int16 float64_to_int16_round_to_zero( float64 STATUS_PARAM );
 unsigned int float64_to_uint16_round_to_zero( float64 STATUS_PARAM );
-int float64_to_int32( float64 STATUS_PARAM );
-int float64_to_int32_round_to_zero( float64 STATUS_PARAM );
-unsigned int float64_to_uint32( float64 STATUS_PARAM );
-unsigned int float64_to_uint32_round_to_zero( float64 STATUS_PARAM );
-int64_t float64_to_int64( float64 STATUS_PARAM );
-int64_t float64_to_int64_round_to_zero( float64 STATUS_PARAM );
-uint64_t float64_to_uint64 (float64 a STATUS_PARAM);
-uint64_t float64_to_uint64_round_to_zero (float64 a STATUS_PARAM);
+int32 float64_to_int32( float64 STATUS_PARAM );
+int32 float64_to_int32_round_to_zero( float64 STATUS_PARAM );
+uint32 float64_to_uint32( float64 STATUS_PARAM );
+uint32 float64_to_uint32_round_to_zero( float64 STATUS_PARAM );
+int64 float64_to_int64( float64 STATUS_PARAM );
+int64 float64_to_int64_round_to_zero( float64 STATUS_PARAM );
+uint64 float64_to_uint64 (float64 a STATUS_PARAM);
+uint64 float64_to_uint64_round_to_zero (float64 a STATUS_PARAM);
 float32 float64_to_float32( float64 STATUS_PARAM );
 #ifdef FLOATX80
 floatx80 float64_to_floatx80( float64 STATUS_PARAM );
@@ -386,6 +438,8 @@ int float64_le_quiet( float64, float64 STATUS_PARAM );
 int float64_lt_quiet( float64, float64 STATUS_PARAM );
 int float64_compare( float64, float64 STATUS_PARAM );
 int float64_compare_quiet( float64, float64 STATUS_PARAM );
+float64 float64_min(float64, float64 STATUS_PARAM);
+float64 float64_max(float64, float64 STATUS_PARAM);
 int float64_is_quiet_nan( float64 a );
 int float64_is_signaling_nan( float64 );
 float64 float64_maybe_silence_nan( float64 );
@@ -427,19 +481,40 @@ INLINE int float64_is_any_nan(float64 a)
     return ((float64_val(a) & ~(1ULL << 63)) > 0x7ff0000000000000ULL);
 }
 
+INLINE float64 float64_set_sign(float64 a, int sign)
+{
+    return make_float64((float64_val(a) & 0x7fffffffffffffffULL)
+                        | ((int64_t)sign << 63));
+}
+
 #define float64_zero make_float64(0)
 #define float64_one make_float64(0x3ff0000000000000LL)
 #define float64_ln2 make_float64(0x3fe62e42fefa39efLL)
+#define float64_half make_float64(0x3fe0000000000000LL)
+#define float64_infinity make_float64(0x7ff0000000000000LL)
+
+/*----------------------------------------------------------------------------
+| The pattern for a default generated double-precision NaN.
+*----------------------------------------------------------------------------*/
+#if defined(TARGET_SPARC)
+#define float64_default_nan make_float64(LIT64( 0x7FFFFFFFFFFFFFFF ))
+#elif defined(TARGET_PPC) || defined(TARGET_ARM) || defined(TARGET_ALPHA)
+#define float64_default_nan make_float64(LIT64( 0x7FF8000000000000 ))
+#elif SNAN_BIT_IS_ONE
+#define float64_default_nan make_float64(LIT64( 0x7FF7FFFFFFFFFFFF ))
+#else
+#define float64_default_nan make_float64(LIT64( 0xFFF8000000000000 ))
+#endif
 
 #ifdef FLOATX80
 
 /*----------------------------------------------------------------------------
 | Software IEC/IEEE extended double-precision conversion routines.
 *----------------------------------------------------------------------------*/
-int floatx80_to_int32( floatx80 STATUS_PARAM );
-int floatx80_to_int32_round_to_zero( floatx80 STATUS_PARAM );
-int64_t floatx80_to_int64( floatx80 STATUS_PARAM );
-int64_t floatx80_to_int64_round_to_zero( floatx80 STATUS_PARAM );
+int32 floatx80_to_int32( floatx80 STATUS_PARAM );
+int32 floatx80_to_int32_round_to_zero( floatx80 STATUS_PARAM );
+int64 floatx80_to_int64( floatx80 STATUS_PARAM );
+int64 floatx80_to_int64_round_to_zero( floatx80 STATUS_PARAM );
 float32 floatx80_to_float32( floatx80 STATUS_PARAM );
 float64 floatx80_to_float64( floatx80 STATUS_PARAM );
 #ifdef FLOAT128
@@ -499,6 +574,19 @@ INLINE int floatx80_is_any_nan(floatx80 a)
     return ((a.high & 0x7fff) == 0x7fff) && (a.low<<1);
 }
 
+/*----------------------------------------------------------------------------
+| The pattern for a default generated extended double-precision NaN.  The
+| `high' and `low' values hold the most- and least-significant bits,
+| respectively.
+*----------------------------------------------------------------------------*/
+#if SNAN_BIT_IS_ONE
+#define floatx80_default_nan_high 0x7FFF
+#define floatx80_default_nan_low  LIT64( 0xBFFFFFFFFFFFFFFF )
+#else
+#define floatx80_default_nan_high 0xFFFF
+#define floatx80_default_nan_low  LIT64( 0xC000000000000000 )
+#endif
+
 #endif
 
 #ifdef FLOAT128
@@ -506,10 +594,10 @@ INLINE int floatx80_is_any_nan(floatx80 a)
 /*----------------------------------------------------------------------------
 | Software IEC/IEEE quadruple-precision conversion routines.
 *----------------------------------------------------------------------------*/
-int float128_to_int32( float128 STATUS_PARAM );
-int float128_to_int32_round_to_zero( float128 STATUS_PARAM );
-int64_t float128_to_int64( float128 STATUS_PARAM );
-int64_t float128_to_int64_round_to_zero( float128 STATUS_PARAM );
+int32 float128_to_int32( float128 STATUS_PARAM );
+int32 float128_to_int32_round_to_zero( float128 STATUS_PARAM );
+int64 float128_to_int64( float128 STATUS_PARAM );
+int64 float128_to_int64_round_to_zero( float128 STATUS_PARAM );
 float32 float128_to_float32( float128 STATUS_PARAM );
 float64 float128_to_float64( float128 STATUS_PARAM );
 #ifdef FLOATX80
@@ -571,6 +659,18 @@ INLINE int float128_is_any_nan(float128 a)
     return ((a.high >> 48) & 0x7fff) == 0x7fff &&
         ((a.low != 0) || ((a.high & 0xffffffffffffLL) != 0));
 }
+
+/*----------------------------------------------------------------------------
+| The pattern for a default generated quadruple-precision NaN.  The `high' and
+| `low' values hold the most- and least-significant bits, respectively.
+*----------------------------------------------------------------------------*/
+#if SNAN_BIT_IS_ONE
+#define float128_default_nan_high LIT64( 0x7FFF7FFFFFFFFFFF )
+#define float128_default_nan_low  LIT64( 0xFFFFFFFFFFFFFFFF )
+#else
+#define float128_default_nan_high LIT64( 0xFFFF800000000000 )
+#define float128_default_nan_low  LIT64( 0x0000000000000000 )
+#endif
 
 #endif
 

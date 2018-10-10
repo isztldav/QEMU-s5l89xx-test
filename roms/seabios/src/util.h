@@ -1,6 +1,6 @@
 // Basic x86 asm functions and function defs.
 //
-// Copyright (C) 2008,2009  Kevin O'Connor <kevin@koconnor.net>
+// Copyright (C) 2008-2010  Kevin O'Connor <kevin@koconnor.net>
 //
 // This file may be distributed under the terms of the GNU LGPLv3 license.
 #ifndef __UTIL_H
@@ -198,6 +198,7 @@ int strcmp(const char *s1, const char *s2);
 inline void memset_far(u16 d_seg, void *d_far, u8 c, size_t len);
 inline void memset16_far(u16 d_seg, void *d_far, u16 c, size_t len);
 void *memset(void *s, int c, size_t n);
+void memset_fl(void *ptr, u8 val, size_t size);
 inline void memcpy_far(u16 d_seg, void *d_far
                        , u16 s_seg, const void *s_far, size_t len);
 void memcpy_fl(void *d_fl, const void *s_fl, size_t len);
@@ -208,12 +209,14 @@ void *memcpy(void *d1, const void *s1, size_t len);
 void iomemcpy(void *d, const void *s, u32 len);
 void *memmove(void *d, const void *s, size_t len);
 char *strtcpy(char *dest, const char *src, size_t len);
+char *strchr(const char *s, int c);
+void nullTrailingSpace(char *buf);
 int get_keystroke(int msec);
 
 // stacks.c
+u32 call32(void *func, u32 eax, u32 errret);
 inline u32 stack_hop(u32 eax, u32 edx, void *func);
 extern struct thread_info MainThread;
-void thread_setup(void);
 struct thread_info *getCurThread(void);
 void yield(void);
 void wait_irq(void);
@@ -235,6 +238,8 @@ void printf(const char *fmt, ...)
     __attribute__ ((format (printf, 1, 2)));
 int snprintf(char *str, size_t size, const char *fmt, ...)
     __attribute__ ((format (printf, 3, 4)));
+char * znprintf(size_t size, const char *fmt, ...)
+    __attribute__ ((format (printf, 2, 3)));
 void __dprintf(const char *fmt, ...)
     __attribute__ ((format (printf, 1, 2)));
 void __debug_enter(struct bregs *regs, const char *fname);
@@ -327,6 +332,7 @@ void useRTC(void);
 void releaseRTC(void);
 
 // apm.c
+void apm_shutdown(void);
 void handle_1553(struct bregs *regs);
 
 // pcibios.c
@@ -338,10 +344,40 @@ void make_bios_writable(void);
 void make_bios_readonly(void);
 void make_bios_writable_intel(u16 bdf, u32 pam0);
 void make_bios_readonly_intel(u16 bdf, u32 pam0);
+void qemu_prep_reset(void);
 
 // smm.c
 void smm_save_and_copy(void);
 void smm_relocate_and_restore(void);
+
+// pci_region.c
+// region allocator. pci region allocates the requested region
+// sequentially with overflow check.
+struct pci_region {
+    // The region is [first, last].
+    u32 first;
+    u32 last;
+
+    // The next allocation starts from here.
+    // i.e. [start, cur_first) is allocated.
+    // Right after initialization cur_first == first.
+    u32 cur_first;
+};
+// initialize the pci_region of [first, last]
+// last must not be 0xffffffff
+void pci_region_init(struct pci_region *r, u32 first, u32 last);
+// allocate the region of size
+u32 pci_region_alloc(struct pci_region *r, u32 size);
+// make the next allocation aligned to align
+u32 pci_region_align(struct pci_region *r, u32 align);
+// revert the allocation to addr.
+void pci_region_revert(struct pci_region *r, u32 addr);
+// make the allocation fail.
+u32 pci_region_disable(struct pci_region *r);
+// returns the current allocation point.
+u32 pci_region_addr(const struct pci_region *r);
+// returns the region size.
+u32 pci_region_size(const struct pci_region *r);
 
 // pciinit.c
 extern const u8 pci_irqs[4];
@@ -356,7 +392,6 @@ extern u32 CountCPUs;
 extern u32 MaxCountCPUs;
 void wrmsr_smp(u32 index, u64 val);
 void smp_probe(void);
-void smp_probe_setup(void);
 
 // coreboot.c
 struct cbfs_file;
@@ -367,6 +402,7 @@ const char *cbfs_filename(struct cbfs_file *file);
 int cbfs_copyfile(struct cbfs_file *file, void *dst, u32 maxlen);
 void cbfs_run_payload(struct cbfs_file *file);
 void coreboot_copy_biostable(void);
+void cbfs_payload_setup(void);
 void coreboot_setup(void);
 
 // vgahooks.c
@@ -433,8 +469,17 @@ static inline void *memalign_low(u32 align, u32 size) {
 static inline void *memalign_high(u32 align, u32 size) {
     return pmm_malloc(&ZoneHigh, PMM_DEFAULT_HANDLE, size, align);
 }
+static inline void *memalign_tmplow(u32 align, u32 size) {
+    return pmm_malloc(&ZoneTmpLow, PMM_DEFAULT_HANDLE, size, align);
+}
 static inline void *memalign_tmphigh(u32 align, u32 size) {
     return pmm_malloc(&ZoneTmpHigh, PMM_DEFAULT_HANDLE, size, align);
+}
+static inline void *memalign_tmp(u32 align, u32 size) {
+    void *ret = memalign_tmphigh(align, size);
+    if (ret)
+        return ret;
+    return memalign_tmplow(align, size);
 }
 static inline void free(void *data) {
     pmm_free(data);

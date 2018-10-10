@@ -30,11 +30,17 @@ struct IRQState {
     int n;
 };
 
+void print_irq(qemu_irq irq)
+{
+	fprintf(stderr, "IRQ: %x\n", irq->n);
+}
+
 void qemu_set_irq(qemu_irq irq, int level)
 {
     if (!irq)
         return;
 
+	//fprintf(stderr, "%s: calling handler for irq %x level %d\n", __FUNCTION__, irq->n, level);
     irq->handler(irq->opaque, irq->n, level);
 }
 
@@ -74,4 +80,19 @@ qemu_irq qemu_irq_invert(qemu_irq irq)
     /* The default state for IRQs is low, so raise the output now.  */
     qemu_irq_raise(irq);
     return qemu_allocate_irqs(qemu_notirq, irq, 1)[0];
+}
+
+static void qemu_splitirq(void *opaque, int line, int level)
+{
+    struct IRQState **irq = opaque;
+    irq[0]->handler(irq[0]->opaque, irq[0]->n, level);
+    irq[1]->handler(irq[1]->opaque, irq[1]->n, level);
+}
+
+qemu_irq qemu_irq_split(qemu_irq irq1, qemu_irq irq2)
+{
+    qemu_irq *s = qemu_mallocz(2 * sizeof(qemu_irq));
+    s[0] = irq1;
+    s[1] = irq2;
+    return qemu_allocate_irqs(qemu_splitirq, s, 1)[0];
 }

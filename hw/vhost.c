@@ -47,8 +47,10 @@ static void vhost_dev_sync_region(struct vhost_dev *dev,
         log = __sync_fetch_and_and(from, 0);
         while ((bit = sizeof(log) > sizeof(int) ?
                 ffsll(log) : ffs(log))) {
+            ram_addr_t ram_addr;
             bit -= 1;
-            cpu_physical_memory_set_dirty(addr + bit * VHOST_LOG_PAGE);
+            ram_addr = cpu_get_physical_page_desc(addr + bit * VHOST_LOG_PAGE);
+            cpu_physical_memory_set_dirty(ram_addr);
             log &= ~(0x1ull << bit);
         }
         addr += VHOST_LOG_CHUNK;
@@ -607,6 +609,8 @@ int vhost_dev_init(struct vhost_dev *hdev, int devfd, bool force)
     hdev->client.set_memory = vhost_client_set_memory;
     hdev->client.sync_dirty_bitmap = vhost_client_sync_dirty_bitmap;
     hdev->client.migration_log = vhost_client_migration_log;
+    hdev->client.log_start = NULL;
+    hdev->client.log_stop = NULL;
     hdev->mem = qemu_mallocz(offsetof(struct vhost_memory, regions));
     hdev->log = NULL;
     hdev->log_size = 0;

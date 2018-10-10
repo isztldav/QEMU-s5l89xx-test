@@ -442,25 +442,19 @@ static void handle_output(VirtIODevice *vdev, VirtQueue *vq)
 {
     VirtIOSerial *vser;
     VirtIOSerialPort *port;
-    bool discard;
 
     vser = DO_UPCAST(VirtIOSerial, vdev, vdev);
     port = find_port_by_vq(vser, vq);
 
-    discard = false;
     if (!port || !port->host_connected || !port->info->have_data) {
-        discard = true;
-    }
-
-    if (discard) {
         discard_vq_data(vq, vdev);
         return;
     }
-    if (port->throttled) {
+
+    if (!port->throttled) {
+        do_flush_queued_data(port, vq, vdev);
         return;
     }
-
-    do_flush_queued_data(port, vq, vdev);
 }
 
 static void handle_input(VirtIODevice *vdev, VirtQueue *vq)
@@ -600,6 +594,9 @@ static int virtio_serial_load(QEMUFile *f, void *opaque, int version_id)
 
         id = qemu_get_be32(f);
         port = find_port_by_id(s, id);
+        if (!port) {
+            return -EINVAL;
+        }
 
         port->guest_connected = qemu_get_byte(f);
         host_connected = qemu_get_byte(f);
@@ -658,8 +655,7 @@ static VirtIOSerialBus *virtser_bus_new(DeviceState *dev)
 
 static void virtser_bus_dev_print(Monitor *mon, DeviceState *qdev, int indent)
 {
-    VirtIOSerialDevice *dev = DO_UPCAST(VirtIOSerialDevice, qdev, qdev);
-    VirtIOSerialPort *port = DO_UPCAST(VirtIOSerialPort, dev, &dev->qdev);
+    VirtIOSerialPort *port = DO_UPCAST(VirtIOSerialPort, dev, qdev);
 
     monitor_printf(mon, "%*s dev-prop-int: id: %u\n",
                    indent, "", port->id);
@@ -721,9 +717,8 @@ static void remove_port(VirtIOSerial *vser, uint32_t port_id)
 
 static int virtser_port_qdev_init(DeviceState *qdev, DeviceInfo *base)
 {
-    VirtIOSerialDevice *dev = DO_UPCAST(VirtIOSerialDevice, qdev, qdev);
+    VirtIOSerialPort *port = DO_UPCAST(VirtIOSerialPort, dev, qdev);
     VirtIOSerialPortInfo *info = DO_UPCAST(VirtIOSerialPortInfo, qdev, base);
-    VirtIOSerialPort *port = DO_UPCAST(VirtIOSerialPort, dev, &dev->qdev);
     VirtIOSerialBus *bus = DO_UPCAST(VirtIOSerialBus, qbus, qdev->parent_bus);
     int ret;
     bool plugging_port0;
@@ -761,8 +756,8 @@ static int virtser_port_qdev_init(DeviceState *qdev, DeviceInfo *base)
         return -1;
     }
 
-    dev->info = info;
-    ret = info->init(dev);
+    port->info = info;
+    ret = info->init(port);
     if (ret) {
         return ret;
     }
@@ -791,8 +786,7 @@ static int virtser_port_qdev_init(DeviceState *qdev, DeviceInfo *base)
 
 static int virtser_port_qdev_exit(DeviceState *qdev)
 {
-    VirtIOSerialDevice *dev = DO_UPCAST(VirtIOSerialDevice, qdev, qdev);
-    VirtIOSerialPort *port = DO_UPCAST(VirtIOSerialPort, dev, &dev->qdev);
+    VirtIOSerialPort *port = DO_UPCAST(VirtIOSerialPort, dev, qdev);
     VirtIOSerial *vser = port->vser;
 
     remove_port(port->vser, port->id);
@@ -800,7 +794,7 @@ static int virtser_port_qdev_exit(DeviceState *qdev)
     QTAILQ_REMOVE(&vser->ports, port, next);
 
     if (port->info->exit)
-        port->info->exit(dev);
+        port->info->exit(port);
 
     return 0;
 }
@@ -814,19 +808,19 @@ void virtio_serial_port_qdev_register(VirtIOSerialPortInfo *info)
     qdev_register(&info->qdev);
 }
 
-VirtIODevice *virtio_serial_init(DeviceState *dev, uint32_t max_nr_ports)
+VirtIODevice *virtio_serial_init(DeviceState *dev, virtio_serial_conf *conf)
 {
     VirtIOSerial *vser;
     VirtIODevice *vdev;
     uint32_t i, max_supported_ports;
 
-    if (!max_nr_ports)
+    if (!conf->max_virtserial_ports)
         return NULL;
 
     /* Each port takes 2 queues, and one pair is for the control queue */
     max_supported_ports = VIRTIO_PCI_QUEUE_MAX / 2 - 1;
 
-    if (max_nr_ports > max_supported_ports) {
+    if (conf->max_virtserial_ports > max_supported_ports) {
         error_report("maximum ports supported: %u", max_supported_ports);
         return NULL;
     }
@@ -842,9 +836,9 @@ VirtIODevice *virtio_serial_init(DeviceState *dev, uint32_t max_nr_ports)
     vser->bus->vser = vser;
     QTAILQ_INIT(&vser->ports);
 
-    vser->bus->max_nr_ports = max_nr_ports;
-    vser->ivqs = qemu_malloc(max_nr_ports * sizeof(VirtQueue *));
-    vser->ovqs = qemu_malloc(max_nr_ports * sizeof(VirtQueue *));
+    vser->bus->max_nr_ports = conf->max_virtserial_ports;
+    vser->ivqs = qemu_malloc(conf->max_virtserial_ports * sizeof(VirtQueue *));
+    vser->ovqs = qemu_malloc(conf->max_virtserial_ports * sizeof(VirtQueue *));
 
     /* Add a queue for host to guest transfers for port 0 (backward compat) */
     vser->ivqs[0] = virtio_add_queue(vdev, 128, handle_input);
@@ -869,8 +863,8 @@ VirtIODevice *virtio_serial_init(DeviceState *dev, uint32_t max_nr_ports)
         vser->ovqs[i] = virtio_add_queue(vdev, 128, handle_output);
     }
 
-    vser->config.max_nr_ports = max_nr_ports;
-    vser->ports_map = qemu_mallocz(((max_nr_ports + 31) / 32)
+    vser->config.max_nr_ports = conf->max_virtserial_ports;
+    vser->ports_map = qemu_mallocz(((conf->max_virtserial_ports + 31) / 32)
         * sizeof(vser->ports_map[0]));
     /*
      * Reserve location 0 for a console port for backward compat

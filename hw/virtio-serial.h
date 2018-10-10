@@ -45,6 +45,11 @@ struct virtio_console_control {
     uint16_t value;		/* Extra information for the key */
 };
 
+struct virtio_serial_conf {
+    /* Max. number of ports we can have for a virtio-serial device */
+    uint32_t max_virtserial_ports;
+};
+
 /* Some events for the internal messages (control packets) */
 #define VIRTIO_CONSOLE_DEVICE_READY	0
 #define VIRTIO_CONSOLE_PORT_ADD		1
@@ -61,11 +66,6 @@ typedef struct VirtIOSerial VirtIOSerial;
 typedef struct VirtIOSerialBus VirtIOSerialBus;
 typedef struct VirtIOSerialPort VirtIOSerialPort;
 typedef struct VirtIOSerialPortInfo VirtIOSerialPortInfo;
-
-typedef struct VirtIOSerialDevice {
-    DeviceState qdev;
-    VirtIOSerialPortInfo *info;
-} VirtIOSerialDevice;
 
 /*
  * This is the state that's shared between all the ports.  Some of the
@@ -136,12 +136,12 @@ struct VirtIOSerialPortInfo {
      * The per-port (or per-app) init function that's called when a
      * new device is found on the bus.
      */
-    int (*init)(VirtIOSerialDevice *dev);
+    int (*init)(VirtIOSerialPort *port);
     /*
      * Per-port exit function that's called when a port gets
      * hot-unplugged or removed.
      */
-    int (*exit)(VirtIOSerialDevice *dev);
+    int (*exit)(VirtIOSerialPort *port);
 
     /* Callbacks for guest events */
         /* Guest opened device. */

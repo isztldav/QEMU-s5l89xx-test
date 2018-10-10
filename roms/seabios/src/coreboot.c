@@ -12,6 +12,7 @@
 #include "biosvar.h" // GET_EBDA
 #include "lzmadecode.h" // LzmaDecode
 #include "smbios.h" // smbios_init
+#include "boot.h" // boot_add_cbfs
 
 
 /****************************************************************
@@ -125,8 +126,6 @@ static void
 coreboot_fill_map(void)
 {
     dprintf(3, "Attempting to find coreboot table\n");
-
-    CBMemTable = NULL;
 
     // Find coreboot table.
     struct cb_header *cbh = find_cb_header(0, 0x1000);
@@ -289,10 +288,6 @@ coreboot_copy_biostable(void)
         return;
 
     dprintf(3, "Relocating coreboot bios tables\n");
-
-    // Init variables set in coreboot table memory scan.
-    PirOffset = 0;
-    RsdpAddr = 0;
 
     // Scan CB_MEM_TABLE areas for bios tables.
     int i, count = MEM_RANGE_COUNT(cbm);
@@ -596,6 +591,21 @@ cbfs_run_payload(struct cbfs_file *file)
             break;
         }
         seg++;
+    }
+}
+
+// Register payloads in "img/" directory with boot system.
+void
+cbfs_payload_setup(void)
+{
+    struct cbfs_file *file = NULL;
+    for (;;) {
+        file = cbfs_findprefix("img/", file);
+        if (!file)
+            break;
+        const char *filename = cbfs_filename(file);
+        char *desc = znprintf(MAXDESCSIZE, "Payload [%s]", &filename[4]);
+        boot_add_cbfs(file, desc, bootprio_find_named_rom(filename, 0));
     }
 }
 

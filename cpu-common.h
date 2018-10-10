@@ -50,6 +50,7 @@ ram_addr_t qemu_ram_alloc_from_ptr(DeviceState *dev, const char *name,
                         ram_addr_t size, void *host);
 ram_addr_t qemu_ram_alloc(DeviceState *dev, const char *name, ram_addr_t size);
 void qemu_ram_free(ram_addr_t addr);
+void qemu_ram_remap(ram_addr_t addr, ram_addr_t length);
 /* This should only be used for ram local to a device.  */
 void *qemu_get_ram_ptr(ram_addr_t addr);
 /* Same but slower, to use for migration, where the order of
@@ -96,6 +97,10 @@ struct CPUPhysMemoryClient {
                              target_phys_addr_t end_addr);
     int (*migration_log)(struct CPUPhysMemoryClient *client,
                          int enable);
+    int (*log_start)(struct CPUPhysMemoryClient *client,
+                     target_phys_addr_t phys_addr, ram_addr_t size);
+    int (*log_stop)(struct CPUPhysMemoryClient *client,
+                    target_phys_addr_t phys_addr, ram_addr_t size);
     QLIST_ENTRY(CPUPhysMemoryClient) list;
 };
 

@@ -12,6 +12,7 @@
 #include "biosvar.h" // struct bios_data_area_s
 #include "disk.h" // floppy_drive_setup
 #include "ata.h" // ata_setup
+#include "ahci.h" // ahci_setup
 #include "memmap.h" // add_e820
 #include "pic.h" // pic_setup
 #include "pci.h" // create_pirtable
@@ -24,6 +25,11 @@
 #include "paravirt.h" // qemu_cfg_port_probe
 #include "ps2port.h" // ps2port_setup
 #include "virtio-blk.h" // virtio_blk_setup
+
+
+/****************************************************************
+ * BIOS init
+ ****************************************************************/
 
 static void
 init_ivt(void)
@@ -77,13 +83,16 @@ init_bda(void)
 
     int esize = EBDA_SIZE_START;
     SET_BDA(mem_size_kb, BUILD_LOWRAM_END/1024 - esize);
-    u16 eseg = EBDA_SEGMENT_START;
-    SET_BDA(ebda_seg, eseg);
+    u16 ebda_seg = EBDA_SEGMENT_START;
+    SET_BDA(ebda_seg, ebda_seg);
 
     // Init ebda
     struct extended_bios_data_area_s *ebda = get_ebda_ptr();
     memset(ebda, 0, sizeof(*ebda));
     ebda->size = esize;
+
+    add_e820((u32)MAKE_FLATPTR(ebda_seg, 0), GET_EBDA2(ebda_seg, size) * 1024
+             , E820_RESERVED);
 }
 
 static void
@@ -120,9 +129,6 @@ ram_probe(void)
     add_e820(BUILD_LOWRAM_END, BUILD_BIOS_ADDR-BUILD_LOWRAM_END, E820_HOLE);
 
     // Mark known areas as reserved.
-    u16 ebda_seg = get_ebda_seg();
-    add_e820((u32)MAKE_FLATPTR(ebda_seg, 0), GET_EBDA2(ebda_seg, size) * 1024
-             , E820_RESERVED);
     add_e820(BUILD_BIOS_ADDR, BUILD_BIOS_SIZE, E820_RESERVED);
 
     u32 count = qemu_cfg_e820_entries();
@@ -173,22 +179,33 @@ init_hw(void)
 
     floppy_setup();
     ata_setup();
+    ahci_setup();
+    cbfs_payload_setup();
     ramdisk_setup();
     virtio_blk_setup();
 }
 
+// Begin the boot process by invoking an int0x19 in 16bit mode.
+void VISIBLE32FLAT
+startBoot(void)
+{
+    // Clear low-memory allocations (required by PMM spec).
+    memset((void*)BUILD_STACK_ADDR, 0, BUILD_EBDA_MINIMUM - BUILD_STACK_ADDR);
+
+    dprintf(3, "Jump to int19\n");
+    struct bregs br;
+    memset(&br, 0, sizeof(br));
+    br.flags = F_IF;
+    call16_int(0x19, &br);
+}
+
 // Main setup code.
 static void
-post(void)
+maininit(void)
 {
-    // Detect and init ram.
+    // Setup ivt/bda/ebda
     init_ivt();
     init_bda();
-    memmap_setup();
-    qemu_cfg_port_probe();
-    ram_probe();
-    malloc_setup();
-    thread_setup();
 
     // Init base pc hardware.
     pic_setup();
@@ -196,16 +213,15 @@ post(void)
     mathcp_setup();
 
     // Initialize mtrr
-    smp_probe_setup();
     mtrr_setup();
 
     // Initialize pci
     pci_setup();
+    pci_path_setup();
     smm_init();
 
     // Initialize internal tables
     boot_setup();
-    drive_setup();
 
     // Start hardware initialization (if optionrom threading)
     if (CONFIG_THREADS && CONFIG_THREAD_OPTIONROMS)
@@ -242,6 +258,113 @@ post(void)
     pmm_finalize();
     malloc_finalize();
     memmap_finalize();
+
+    // Setup bios checksum.
+    BiosChecksum -= checksum((u8*)BUILD_BIOS_ADDR, BUILD_BIOS_SIZE);
+
+    // Write protect bios memory.
+    make_bios_readonly();
+
+    // Invoke int 19 to start boot process.
+    startBoot();
+}
+
+
+/****************************************************************
+ * Code relocation
+ ****************************************************************/
+
+// Update given relocs for the code at 'dest' with a given 'delta'
+static void
+updateRelocs(void *dest, u32 *rstart, u32 *rend, u32 delta)
+{
+    u32 *reloc;
+    for (reloc = rstart; reloc < rend; reloc++)
+        *((u32*)(dest + *reloc)) += delta;
+}
+
+// Start of Power On Self Test - the BIOS initilization.  This
+// function sets up for and attempts relocation of the init code.
+static void
+reloc_init(void)
+{
+    if (!CONFIG_RELOCATE_INIT) {
+        maininit();
+        return;
+    }
+    // Symbols populated by the build.
+    extern u8 code32flat_start[];
+    extern u8 _reloc_min_align[];
+    extern u32 _reloc_abs_start[], _reloc_abs_end[];
+    extern u32 _reloc_rel_start[], _reloc_rel_end[];
+    extern u32 _reloc_init_start[], _reloc_init_end[];
+    extern u8 code32init_start[], code32init_end[];
+
+    // Allocate space for init code.
+    u32 initsize = code32init_end - code32init_start;
+    u32 align = (u32)&_reloc_min_align;
+    void *dest = memalign_tmp(align, initsize);
+    if (!dest)
+        panic("No space for init relocation.\n");
+
+    // Copy code and update relocs (init absolute, init relative, and runtime)
+    dprintf(1, "Relocating init from %p to %p (size %d)\n"
+            , code32init_start, dest, initsize);
+    s32 delta = dest - (void*)code32init_start;
+    memcpy(dest, code32init_start, initsize);
+    updateRelocs(dest, _reloc_abs_start, _reloc_abs_end, delta);
+    updateRelocs(dest, _reloc_rel_start, _reloc_rel_end, -delta);
+    updateRelocs(code32flat_start, _reloc_init_start, _reloc_init_end, delta);
+
+    // Call maininit() in relocated code.
+    void (*func)(void) = (void*)maininit + delta;
+    barrier();
+    func();
+}
+
+// Start of Power On Self Test (POST) - the BIOS initilization phase.
+// This function sets up for and attempts relocation of the init code.
+void VISIBLE32INIT
+post(void)
+{
+    // Detect ram and setup internal malloc.
+    qemu_cfg_port_probe();
+    ram_probe();
+    malloc_setup();
+
+    reloc_init();
+}
+
+
+/****************************************************************
+ * POST entry point
+ ****************************************************************/
+
+static int HaveRunPost;
+
+// Attempt to invoke a hard-reboot.
+static void
+tryReboot(void)
+{
+    dprintf(1, "Attempting a hard reboot\n");
+
+    // Setup for reset on qemu.
+    if (! CONFIG_COREBOOT) {
+        qemu_prep_reset();
+        if (HaveRunPost)
+            apm_shutdown();
+    }
+
+    // Try keyboard controller reboot.
+    i8042_reboot();
+
+    // Try PCI 0xcf9 reboot
+    pci_reboot();
+
+    // Try triple fault
+    asm volatile("int3");
+
+    panic("Could not reboot");
 }
 
 // 32-bit entry point.
@@ -253,22 +376,14 @@ _start(void)
     debug_serial_setup();
     dprintf(1, "Start bios (version %s)\n", VERSION);
 
+    if (HaveRunPost)
+        // This is a soft reboot - invoke a hard reboot.
+        tryReboot();
+
     // Allow writes to modify bios area (0xf0000)
     make_bios_writable();
+    HaveRunPost = 1;
 
     // Perform main setup code.
     post();
-
-    // Setup bios checksum.
-    BiosChecksum -= checksum((u8*)BUILD_BIOS_ADDR, BUILD_BIOS_SIZE);
-
-    // Write protect bios memory.
-    make_bios_readonly();
-
-    // Invoke int 19 to start boot process.
-    dprintf(3, "Jump to int19\n");
-    struct bregs br;
-    memset(&br, 0, sizeof(br));
-    br.flags = F_IF;
-    call16_int(0x19, &br);
 }

@@ -45,7 +45,12 @@
 enum {
     GDB_SIGNAL_0 = 0,
     GDB_SIGNAL_INT = 2,
+    GDB_SIGNAL_QUIT = 3,
     GDB_SIGNAL_TRAP = 5,
+    GDB_SIGNAL_ABRT = 6,
+    GDB_SIGNAL_ALRM = 14,
+    GDB_SIGNAL_IO = 23,
+    GDB_SIGNAL_XCPU = 24,
     GDB_SIGNAL_UNKNOWN = 143
 };
 
@@ -1462,6 +1467,80 @@ static int cpu_gdb_write_register(CPUState *env, uint8_t *mem_buf, int n)
 
     return r;
 }
+#elif defined (TARGET_LM32)
+
+#include "hw/lm32_pic.h"
+#define NUM_CORE_REGS (32 + 7)
+
+static int cpu_gdb_read_register(CPUState *env, uint8_t *mem_buf, int n)
+{
+    if (n < 32) {
+        GET_REG32(env->regs[n]);
+    } else {
+        switch (n) {
+        case 32:
+            GET_REG32(env->pc);
+            break;
+        /* FIXME: put in right exception ID */
+        case 33:
+            GET_REG32(0);
+            break;
+        case 34:
+            GET_REG32(env->eba);
+            break;
+        case 35:
+            GET_REG32(env->deba);
+            break;
+        case 36:
+            GET_REG32(env->ie);
+            break;
+        case 37:
+            GET_REG32(lm32_pic_get_im(env->pic_state));
+            break;
+        case 38:
+            GET_REG32(lm32_pic_get_ip(env->pic_state));
+            break;
+        }
+    }
+    return 0;
+}
+
+static int cpu_gdb_write_register(CPUState *env, uint8_t *mem_buf, int n)
+{
+    uint32_t tmp;
+
+    if (n > NUM_CORE_REGS) {
+        return 0;
+    }
+
+    tmp = ldl_p(mem_buf);
+
+    if (n < 32) {
+        env->regs[n] = tmp;
+    } else {
+        switch (n) {
+        case 32:
+            env->pc = tmp;
+            break;
+        case 34:
+            env->eba = tmp;
+            break;
+        case 35:
+            env->deba = tmp;
+            break;
+        case 36:
+            env->ie = tmp;
+            break;
+        case 37:
+            lm32_pic_set_im(env->pic_state, tmp);
+            break;
+        case 38:
+            lm32_pic_set_ip(env->pic_state, tmp);
+            break;
+        }
+    }
+    return 4;
+}
 #else
 
 #define NUM_CORE_REGS 0
@@ -1737,6 +1816,8 @@ static void gdb_set_cpu_pc(GDBState *s, target_ulong pc)
 #elif defined (TARGET_S390X)
     cpu_synchronize_state(s->c_cpu);
     s->c_cpu->psw.addr = pc;
+#elif defined (TARGET_LM32)
+    s->c_cpu->pc = pc;
 #endif
 }
 
@@ -2194,14 +2275,11 @@ static void gdb_vm_state_change(void *opaque, int running, int reason)
     const char *type;
     int ret;
 
-    if (running || (reason != EXCP_DEBUG && reason != EXCP_INTERRUPT) ||
-        s->state == RS_INACTIVE || s->state == RS_SYSCALL)
+    if (running || s->state == RS_INACTIVE || s->state == RS_SYSCALL) {
         return;
-
-    /* disable single step if it was enable */
-    cpu_single_step(env, 0);
-
-    if (reason == EXCP_DEBUG) {
+    }
+    switch (reason) {
+    case VMSTOP_DEBUG:
         if (env->watchpoint_hit) {
             switch (env->watchpoint_hit->flags & BP_MEM_ACCESS) {
             case BP_MEM_READ:
@@ -2218,17 +2296,44 @@ static void gdb_vm_state_change(void *opaque, int running, int reason)
                      "T%02xthread:%02x;%swatch:" TARGET_FMT_lx ";",
                      GDB_SIGNAL_TRAP, gdb_id(env), type,
                      env->watchpoint_hit->vaddr);
-            put_packet(s, buf);
             env->watchpoint_hit = NULL;
-            return;
+            goto send_packet;
         }
-	tb_flush(env);
+        tb_flush(env);
         ret = GDB_SIGNAL_TRAP;
-    } else {
+        break;
+    case VMSTOP_USER:
         ret = GDB_SIGNAL_INT;
+        break;
+    case VMSTOP_SHUTDOWN:
+        ret = GDB_SIGNAL_QUIT;
+        break;
+    case VMSTOP_DISKFULL:
+        ret = GDB_SIGNAL_IO;
+        break;
+    case VMSTOP_WATCHDOG:
+        ret = GDB_SIGNAL_ALRM;
+        break;
+    case VMSTOP_PANIC:
+        ret = GDB_SIGNAL_ABRT;
+        break;
+    case VMSTOP_SAVEVM:
+    case VMSTOP_LOADVM:
+        return;
+    case VMSTOP_MIGRATE:
+        ret = GDB_SIGNAL_XCPU;
+        break;
+    default:
+        ret = GDB_SIGNAL_UNKNOWN;
+        break;
     }
     snprintf(buf, sizeof(buf), "T%02xthread:%02x;", ret, gdb_id(env));
+
+send_packet:
     put_packet(s, buf);
+
+    /* disable single step if it was enabled */
+    cpu_single_step(env, 0);
 }
 #endif
 
@@ -2252,7 +2357,7 @@ void gdb_do_syscall(gdb_syscall_complete_cb cb, const char *fmt, ...)
     gdb_current_syscall_cb = cb;
     s->state = RS_SYSCALL;
 #ifndef CONFIG_USER_ONLY
-    vm_stop(EXCP_DEBUG);
+    vm_stop(VMSTOP_DEBUG);
 #endif
     s->state = RS_IDLE;
     va_start(va, fmt);
@@ -2326,7 +2431,7 @@ static void gdb_read_byte(GDBState *s, int ch)
     if (vm_running) {
         /* when the CPU is running, we cannot do anything except stop
            it when receiving a char */
-        vm_stop(EXCP_INTERRUPT);
+        vm_stop(VMSTOP_USER);
     } else
 #endif
     {
@@ -2588,7 +2693,7 @@ static void gdb_chr_event(void *opaque, int event)
 {
     switch (event) {
     case CHR_EVENT_OPENED:
-        vm_stop(EXCP_INTERRUPT);
+        vm_stop(VMSTOP_USER);
         gdb_has_xml = 0;
         break;
     default:
@@ -2628,8 +2733,9 @@ static int gdb_monitor_write(CharDriverState *chr, const uint8_t *buf, int len)
 #ifndef _WIN32
 static void gdb_sigterm_handler(int signal)
 {
-    if (vm_running)
-        vm_stop(EXCP_INTERRUPT);
+    if (vm_running) {
+        vm_stop(VMSTOP_USER);
+    }
 }
 #endif
 

@@ -32,6 +32,21 @@
 #define QEMU_RGBA(r, g, b, a) (((a) << 24) | ((r) << 16) | ((g) << 8) | (b))
 #define QEMU_RGB(r, g, b) QEMU_RGBA(r, g, b, 0xff)
 
+#ifdef CONFIG_SKINNING
+// Skinning overwrites these functions to put the skin in between
+DisplayState *qemu_graphic_console_init(vga_hw_update_ptr update,
+                                   vga_hw_invalidate_ptr invalidate,
+                                   vga_hw_screen_dump_ptr screen_dump,
+                                   vga_hw_text_update_ptr text_update,
+                                   void *opaque);
+#undef graphic_console_init
+#define graphic_console_init qemu_graphic_console_init
+
+void original_qemu_console_resize(DisplayState *ds, int width, int height);
+#undef qemu_console_resize
+#define qemu_console_resize original_qemu_console_resize
+#endif
+
 typedef struct TextAttributes {
     uint8_t fgcol:4;
     uint8_t bgcol:4;
@@ -227,7 +242,7 @@ static unsigned int vga_get_color(DisplayState *ds, unsigned int rgba)
     return color;
 }
 
-static void vga_fill_rect (DisplayState *ds,
+void vga_fill_rect (DisplayState *ds,
                            int posx, int posy, int width, int height, uint32_t color)
 {
     uint8_t *d, *d1;
@@ -1135,7 +1150,7 @@ static void kbd_send_chars(void *opaque)
     /* characters are pending: we send them a bit later (XXX:
        horrible, should change char device API) */
     if (s->out_fifo.count > 0) {
-        qemu_mod_timer(s->kbd_timer, qemu_get_clock(rt_clock) + 1);
+        qemu_mod_timer(s->kbd_timer, qemu_get_clock_ms(rt_clock) + 1);
     }
 }
 
@@ -1278,38 +1293,40 @@ static DisplaySurface* defaultallocator_create_displaysurface(int width, int hei
 {
     DisplaySurface *surface = (DisplaySurface*) qemu_mallocz(sizeof(DisplaySurface));
 
-    surface->width = width;
-    surface->height = height;
-    surface->linesize = width * 4;
-    surface->pf = qemu_default_pixelformat(32);
-#ifdef HOST_WORDS_BIGENDIAN
-    surface->flags = QEMU_ALLOCATED_FLAG | QEMU_BIG_ENDIAN_FLAG;
-#else
-    surface->flags = QEMU_ALLOCATED_FLAG;
-#endif
-    surface->data = (uint8_t*) qemu_mallocz(surface->linesize * surface->height);
-
+    int linesize = width * 4;
+    qemu_alloc_display(surface, width, height, linesize,
+                       qemu_default_pixelformat(32), 0);
     return surface;
 }
 
 static DisplaySurface* defaultallocator_resize_displaysurface(DisplaySurface *surface,
                                           int width, int height)
 {
+    int linesize = width * 4;
+    qemu_alloc_display(surface, width, height, linesize,
+                       qemu_default_pixelformat(32), 0);
+    return surface;
+}
+
+void qemu_alloc_display(DisplaySurface *surface, int width, int height,
+                        int linesize, PixelFormat pf, int newflags)
+{
+    void *data;
     surface->width = width;
     surface->height = height;
-    surface->linesize = width * 4;
-    surface->pf = qemu_default_pixelformat(32);
-    if (surface->flags & QEMU_ALLOCATED_FLAG)
-        surface->data = (uint8_t*) qemu_realloc(surface->data, surface->linesize * surface->height);
-    else
-        surface->data = (uint8_t*) qemu_malloc(surface->linesize * surface->height);
+    surface->linesize = linesize;
+    surface->pf = pf;
+    if (surface->flags & QEMU_ALLOCATED_FLAG) {
+        data = qemu_realloc(surface->data,
+                            surface->linesize * surface->height);
+    } else {
+        data = qemu_malloc(surface->linesize * surface->height);
+    }
+    surface->data = (uint8_t *)data;
+    surface->flags = newflags | QEMU_ALLOCATED_FLAG;
 #ifdef HOST_WORDS_BIGENDIAN
-    surface->flags = QEMU_ALLOCATED_FLAG | QEMU_BIG_ENDIAN_FLAG;
-#else
-    surface->flags = QEMU_ALLOCATED_FLAG;
+    surface->flags |= QEMU_BIG_ENDIAN_FLAG;
 #endif
-
-    return surface;
 }
 
 DisplaySurface* qemu_create_displaysurface_from(int width, int height, int bpp,
@@ -1457,7 +1474,7 @@ static void text_console_do_init(CharDriverState *chr, DisplayState *ds)
 
     s->out_fifo.buf = s->out_fifo_buf;
     s->out_fifo.buf_size = sizeof(s->out_fifo_buf);
-    s->kbd_timer = qemu_new_timer(rt_clock, kbd_send_chars, s);
+    s->kbd_timer = qemu_new_timer_ms(rt_clock, kbd_send_chars, s);
     s->ds = ds;
 
     if (!color_inited) {

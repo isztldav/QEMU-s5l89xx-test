@@ -126,6 +126,7 @@ typedef struct CPUARMState {
         uint32_t c6_region[8]; /* MPU base/size registers.  */
         uint32_t c6_insn; /* Fault address registers.  */
         uint32_t c6_data;
+        uint32_t c7_par;  /* Translation result. */
         uint32_t c9_insn; /* Cache lockdown registers.  */
         uint32_t c9_data;
         uint32_t c13_fcse; /* FCSE PID.  */
@@ -156,10 +157,6 @@ typedef struct CPUARMState {
 
     /* Internal CPU feature flags.  */
     uint32_t features;
-
-    /* Callback for vectored interrupt controller.  */
-    int (*get_irq_vector)(struct CPUARMState *);
-    void *irq_opaque;
 
     /* VFP coprocessor state.  */
     struct {
@@ -362,7 +359,8 @@ enum arm_features {
     ARM_FEATURE_DIV,
     ARM_FEATURE_M, /* Microcontroller profile.  */
     ARM_FEATURE_OMAPCP, /* OMAP specific CP15 ops handling.  */
-    ARM_FEATURE_THUMB2EE
+    ARM_FEATURE_THUMB2EE,
+    ARM_FEATURE_V7MP    /* v7 Multiprocessing Extensions */
 };
 
 static inline int arm_feature(CPUARMState *env, int feature)
@@ -431,7 +429,7 @@ void cpu_arm_set_cp_io(CPUARMState *env, int cpnum,
 #define cpu_signal_handler cpu_arm_signal_handler
 #define cpu_list arm_cpu_list
 
-#define CPU_SAVE_VERSION 2
+#define CPU_SAVE_VERSION 3
 
 /* MMU modes definitions */
 #define MMU_MODE0_SUFFIX _kernel

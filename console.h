@@ -4,6 +4,8 @@
 #include "qemu-char.h"
 #include "qdict.h"
 #include "notify.h"
+#include "qerror.h"
+#include "monitor.h"
 
 /* keyboard/mouse support */
 
@@ -161,7 +163,10 @@ struct DisplayChangeListener {
     void (*dpy_fill)(struct DisplayState *s, int x, int y,
                      int w, int h, uint32_t c);
     void (*dpy_text_cursor)(struct DisplayState *s, int x, int y);
-
+#ifdef CONFIG_SKINNING
+    void (*dpy_enablezoom)(struct DisplayState *s, int width, int height);
+    void (*dpy_getresolution)(int *width, int *height);
+#endif
     struct DisplayChangeListener *next;
 };
 
@@ -189,6 +194,8 @@ void register_displaystate(DisplayState *ds);
 DisplayState *get_displaystate(void);
 DisplaySurface* qemu_create_displaysurface_from(int width, int height, int bpp,
                                                 int linesize, uint8_t *data);
+void qemu_alloc_display(DisplaySurface *surface, int width, int height,
+                        int linesize, PixelFormat pf, int newflags);
 PixelFormat qemu_different_endianness_pixelformat(int bpp);
 PixelFormat qemu_default_pixelformat(int bpp);
 
@@ -294,6 +301,26 @@ static inline void dpy_cursor(struct DisplayState *s, int x, int y) {
     }
 }
 
+#ifdef CONFIG_SKINNING
+static inline void dpy_enablezoom(struct DisplayState *s, int width, int height)
+{
+    struct DisplayChangeListener *dcl = s->listeners;
+    while (dcl != NULL) {
+        if (dcl->dpy_enablezoom) dcl->dpy_enablezoom(s, width, height);
+        dcl = dcl->next;
+    }
+}
+
+static inline void dpy_getresolution(struct DisplayState *s, int *width, int *height)
+{
+    struct DisplayChangeListener *dcl = s->listeners;
+    while (dcl != NULL) {
+        if (dcl->dpy_getresolution) dcl->dpy_getresolution(width, height);
+        dcl = dcl->next;
+    }
+}
+#endif
+
 static inline int ds_get_linesize(DisplayState *ds)
 {
     return ds->surface->linesize;
@@ -358,6 +385,9 @@ void qemu_console_resize(DisplayState *ds, int width, int height);
 void qemu_console_copy(DisplayState *ds, int src_x, int src_y,
                        int dst_x, int dst_y, int w, int h);
 
+void vga_fill_rect (DisplayState *ds,
+                           int posx, int posy, int width, int height, uint32_t color);
+
 /* sdl.c */
 void sdl_display_init(DisplayState *ds, int full_screen, int no_frame);
 
@@ -368,12 +398,32 @@ void cocoa_display_init(DisplayState *ds, int full_screen);
 void vnc_display_init(DisplayState *ds);
 void vnc_display_close(DisplayState *ds);
 int vnc_display_open(DisplayState *ds, const char *display);
-int vnc_display_password(DisplayState *ds, const char *password);
 int vnc_display_disable_login(DisplayState *ds);
+char *vnc_display_local_addr(DisplayState *ds);
+#ifdef CONFIG_VNC
+int vnc_display_password(DisplayState *ds, const char *password);
 int vnc_display_pw_expire(DisplayState *ds, time_t expires);
 void do_info_vnc_print(Monitor *mon, const QObject *data);
 void do_info_vnc(Monitor *mon, QObject **ret_data);
-char *vnc_display_local_addr(DisplayState *ds);
+#else
+static inline int vnc_display_password(DisplayState *ds, const char *password)
+{
+    qerror_report(QERR_FEATURE_DISABLED, "vnc");
+    return -ENODEV;
+}
+static inline int vnc_display_pw_expire(DisplayState *ds, time_t expires)
+{
+    qerror_report(QERR_FEATURE_DISABLED, "vnc");
+    return -ENODEV;
+};
+static inline void do_info_vnc(Monitor *mon, QObject **ret_data)
+{
+};
+static inline void do_info_vnc_print(Monitor *mon, const QObject *data)
+{
+    monitor_printf(mon, "VNC support disabled\n");
+};
+#endif
 
 /* curses.c */
 void curses_display_init(DisplayState *ds, int full_screen);

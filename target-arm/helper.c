@@ -123,6 +123,11 @@ static void cpu_reset_model_id(CPUARMState *env, uint32_t id)
         set_feature(env, ARM_FEATURE_VFP_FP16);
         set_feature(env, ARM_FEATURE_NEON);
         set_feature(env, ARM_FEATURE_THUMB2EE);
+        /* Note that A9 supports the MP extensions even for
+         * A9UP and single-core A9MP (which are both different
+         * and valid configurations; we don't model A9UP).
+         */
+        set_feature(env, ARM_FEATURE_V7MP);
         env->vfp.xregs[ARM_VFP_FPSID] = 0x41034000; /* Guess */
         env->vfp.xregs[ARM_VFP_MVFR0] = 0x11110222;
         env->vfp.xregs[ARM_VFP_MVFR1] = 0x01111111;
@@ -152,6 +157,7 @@ static void cpu_reset_model_id(CPUARMState *env, uint32_t id)
         set_feature(env, ARM_FEATURE_NEON);
         set_feature(env, ARM_FEATURE_THUMB2EE);
         set_feature(env, ARM_FEATURE_DIV);
+        set_feature(env, ARM_FEATURE_V7MP);
         break;
     case ARM_CPUID_TI915T:
     case ARM_CPUID_TI925T:
@@ -1450,8 +1456,49 @@ void HELPER(set_cp15)(CPUState *env, uint32_t insn, uint32_t val)
     case 7: /* Cache control.  */
         env->cp15.c15_i_max = 0x000;
         env->cp15.c15_i_min = 0xff0;
-        /* No cache, so nothing to do.  */
-        /* ??? MPCore has VA to PA translation functions.  */
+        if (op1 != 0) {
+            goto bad_reg;
+        }
+        /* No cache, so nothing to do except VA->PA translations. */
+        if (arm_feature(env, ARM_FEATURE_V6K)) {
+            switch (crm) {
+            case 4:
+                if (arm_feature(env, ARM_FEATURE_V7)) {
+                    env->cp15.c7_par = val & 0xfffff6ff;
+                } else {
+                    env->cp15.c7_par = val & 0xfffff1ff;
+                }
+                break;
+            case 8: {
+                uint32_t phys_addr;
+                target_ulong page_size;
+                int prot;
+                int ret, is_user = op2 & 2;
+                int access_type = op2 & 1;
+
+                if (op2 & 4) {
+                    /* Other states are only available with TrustZone */
+                    goto bad_reg;
+                }
+                ret = get_phys_addr(env, val, access_type, is_user,
+                                    &phys_addr, &prot, &page_size);
+                if (ret == 0) {
+                    /* We do not set any attribute bits in the PAR */
+                    if (page_size == (1 << 24)
+                        && arm_feature(env, ARM_FEATURE_V7)) {
+                        env->cp15.c7_par = (phys_addr & 0xff000000) | 1 << 1;
+                    } else {
+                        env->cp15.c7_par = phys_addr & 0xfffff000;
+                    }
+                } else {
+                    env->cp15.c7_par = ((ret & (10 << 1)) >> 5) |
+                                       ((ret & (12 << 1)) >> 6) |
+                                       ((ret & 0xf) << 1) | 1;
+                }
+                break;
+            }
+            }
+        }
         break;
     case 8: /* MMU TLB control.  */
         switch (op2) {
@@ -1602,12 +1649,28 @@ uint32_t HELPER(get_cp15)(CPUState *env, uint32_t insn)
                     return 0;
                 case 3: /* TLB type register.  */
                     return 0; /* No lockable TLB entries.  */
-                case 5: /* CPU ID */
-                    if (ARM_CPUID(env) == ARM_CPUID_CORTEXA9) {
-                        return env->cpu_index | 0x80000900;
-                    } else {
-                        return env->cpu_index;
+                case 5: /* MPIDR */
+                    /* The MPIDR was standardised in v7; prior to
+                     * this it was implemented only in the 11MPCore.
+                     * For all other pre-v7 cores it does not exist.
+                     */
+                    if (arm_feature(env, ARM_FEATURE_V7) ||
+                        ARM_CPUID(env) == ARM_CPUID_ARM11MPCORE) {
+                        int mpidr = env->cpu_index;
+                        /* We don't support setting cluster ID ([8..11])
+                         * so these bits always RAZ.
+                         */
+                        if (arm_feature(env, ARM_FEATURE_V7MP)) {
+                            mpidr |= (1 << 31);
+                            /* Cores which are uniprocessor (non-coherent)
+                             * but still implement the MP extensions set
+                             * bit 30. (For instance, A9UP.) However we do
+                             * not currently model any of those cores.
+                             */
+                        }
+                        return mpidr;
                     }
+                    /* otherwise fall through to the unimplemented-reg case */
                 default:
                     goto bad_reg;
                 }
@@ -1767,6 +1830,9 @@ uint32_t HELPER(get_cp15)(CPUState *env, uint32_t insn)
 	    }
         }
     case 7: /* Cache control.  */
+        if (crm == 4 && op1 == 0 && op2 == 0) {
+            return env->cp15.c7_par;
+        }
         /* FIXME: Should only clear Z flag if destination is r15.  */
         env->ZF = 0;
         return 0;
@@ -2105,7 +2171,7 @@ static inline uint8_t sub8_usat(uint8_t a, uint8_t b)
 /* Signed modulo arithmetic.  */
 #define SARITH16(a, b, n, op) do { \
     int32_t sum; \
-    sum = (int16_t)((uint16_t)(a) op (uint16_t)(b)); \
+    sum = (int32_t)(int16_t)(a) op (int32_t)(int16_t)(b); \
     RESULT(sum, n, 16); \
     if (sum >= 0) \
         ge |= 3 << (n * 2); \
@@ -2113,7 +2179,7 @@ static inline uint8_t sub8_usat(uint8_t a, uint8_t b)
 
 #define SARITH8(a, b, n, op) do { \
     int32_t sum; \
-    sum = (int8_t)((uint8_t)(a) op (uint8_t)(b)); \
+    sum = (int32_t)(int8_t)(a) op (int32_t)(int8_t)(b); \
     RESULT(sum, n, 8); \
     if (sum >= 0) \
         ge |= 1 << n; \
@@ -2420,135 +2486,90 @@ DO_VFP_cmp(s, float32)
 DO_VFP_cmp(d, float64)
 #undef DO_VFP_cmp
 
-/* Helper routines to perform bitwise copies between float and int.  */
-static inline float32 vfp_itos(uint32_t i)
-{
-    union {
-        uint32_t i;
-        float32 s;
-    } v;
-
-    v.i = i;
-    return v.s;
-}
-
-static inline uint32_t vfp_stoi(float32 s)
-{
-    union {
-        uint32_t i;
-        float32 s;
-    } v;
-
-    v.s = s;
-    return v.i;
-}
-
-static inline float64 vfp_itod(uint64_t i)
-{
-    union {
-        uint64_t i;
-        float64 d;
-    } v;
-
-    v.i = i;
-    return v.d;
-}
-
-static inline uint64_t vfp_dtoi(float64 d)
-{
-    union {
-        uint64_t i;
-        float64 d;
-    } v;
-
-    v.d = d;
-    return v.i;
-}
-
 /* Integer to float conversion.  */
-float32 VFP_HELPER(uito, s)(float32 x, CPUState *env)
+float32 VFP_HELPER(uito, s)(uint32_t x, CPUState *env)
 {
-    return uint32_to_float32(vfp_stoi(x), &env->vfp.fp_status);
+    return uint32_to_float32(x, &env->vfp.fp_status);
 }
 
-float64 VFP_HELPER(uito, d)(float32 x, CPUState *env)
+float64 VFP_HELPER(uito, d)(uint32_t x, CPUState *env)
 {
-    return uint32_to_float64(vfp_stoi(x), &env->vfp.fp_status);
+    return uint32_to_float64(x, &env->vfp.fp_status);
 }
 
-float32 VFP_HELPER(sito, s)(float32 x, CPUState *env)
+float32 VFP_HELPER(sito, s)(uint32_t x, CPUState *env)
 {
-    return int32_to_float32(vfp_stoi(x), &env->vfp.fp_status);
+    return int32_to_float32(x, &env->vfp.fp_status);
 }
 
-float64 VFP_HELPER(sito, d)(float32 x, CPUState *env)
+float64 VFP_HELPER(sito, d)(uint32_t x, CPUState *env)
 {
-    return int32_to_float64(vfp_stoi(x), &env->vfp.fp_status);
+    return int32_to_float64(x, &env->vfp.fp_status);
 }
 
 /* Float to integer conversion.  */
-float32 VFP_HELPER(toui, s)(float32 x, CPUState *env)
+uint32_t VFP_HELPER(toui, s)(float32 x, CPUState *env)
 {
     if (float32_is_any_nan(x)) {
-        return float32_zero;
+        return 0;
     }
-    return vfp_itos(float32_to_uint32(x, &env->vfp.fp_status));
+    return float32_to_uint32(x, &env->vfp.fp_status);
 }
 
-float32 VFP_HELPER(toui, d)(float64 x, CPUState *env)
+uint32_t VFP_HELPER(toui, d)(float64 x, CPUState *env)
 {
     if (float64_is_any_nan(x)) {
-        return float32_zero;
+        return 0;
     }
-    return vfp_itos(float64_to_uint32(x, &env->vfp.fp_status));
+    return float64_to_uint32(x, &env->vfp.fp_status);
 }
 
-float32 VFP_HELPER(tosi, s)(float32 x, CPUState *env)
+uint32_t VFP_HELPER(tosi, s)(float32 x, CPUState *env)
 {
     if (float32_is_any_nan(x)) {
-        return float32_zero;
+        return 0;
     }
-    return vfp_itos(float32_to_int32(x, &env->vfp.fp_status));
+    return float32_to_int32(x, &env->vfp.fp_status);
 }
 
-float32 VFP_HELPER(tosi, d)(float64 x, CPUState *env)
+uint32_t VFP_HELPER(tosi, d)(float64 x, CPUState *env)
 {
     if (float64_is_any_nan(x)) {
-        return float32_zero;
+        return 0;
     }
-    return vfp_itos(float64_to_int32(x, &env->vfp.fp_status));
+    return float64_to_int32(x, &env->vfp.fp_status);
 }
 
-float32 VFP_HELPER(touiz, s)(float32 x, CPUState *env)
+uint32_t VFP_HELPER(touiz, s)(float32 x, CPUState *env)
 {
     if (float32_is_any_nan(x)) {
-        return float32_zero;
+        return 0;
     }
-    return vfp_itos(float32_to_uint32_round_to_zero(x, &env->vfp.fp_status));
+    return float32_to_uint32_round_to_zero(x, &env->vfp.fp_status);
 }
 
-float32 VFP_HELPER(touiz, d)(float64 x, CPUState *env)
+uint32_t VFP_HELPER(touiz, d)(float64 x, CPUState *env)
 {
     if (float64_is_any_nan(x)) {
-        return float32_zero;
+        return 0;
     }
-    return vfp_itos(float64_to_uint32_round_to_zero(x, &env->vfp.fp_status));
+    return float64_to_uint32_round_to_zero(x, &env->vfp.fp_status);
 }
 
-float32 VFP_HELPER(tosiz, s)(float32 x, CPUState *env)
+uint32_t VFP_HELPER(tosiz, s)(float32 x, CPUState *env)
 {
     if (float32_is_any_nan(x)) {
-        return float32_zero;
+        return 0;
     }
-    return vfp_itos(float32_to_int32_round_to_zero(x, &env->vfp.fp_status));
+    return float32_to_int32_round_to_zero(x, &env->vfp.fp_status);
 }
 
-float32 VFP_HELPER(tosiz, d)(float64 x, CPUState *env)
+uint32_t VFP_HELPER(tosiz, d)(float64 x, CPUState *env)
 {
     if (float64_is_any_nan(x)) {
-        return float32_zero;
+        return 0;
     }
-    return vfp_itos(float64_to_int32_round_to_zero(x, &env->vfp.fp_status));
+    return float64_to_int32_round_to_zero(x, &env->vfp.fp_status);
 }
 
 /* floating point conversion */
@@ -2571,110 +2592,307 @@ float32 VFP_HELPER(fcvts, d)(float64 x, CPUState *env)
 }
 
 /* VFP3 fixed point conversion.  */
-#define VFP_CONV_FIX(name, p, ftype, itype, sign) \
-ftype VFP_HELPER(name##to, p)(ftype x, uint32_t shift, CPUState *env) \
+#define VFP_CONV_FIX(name, p, fsz, itype, sign) \
+float##fsz VFP_HELPER(name##to, p)(uint##fsz##_t  x, uint32_t shift, \
+                                   CPUState *env) \
 { \
-    ftype tmp; \
-    tmp = sign##int32_to_##ftype ((itype##_t)vfp_##p##toi(x), \
-                                  &env->vfp.fp_status); \
-    return ftype##_scalbn(tmp, -(int)shift, &env->vfp.fp_status); \
+    float##fsz tmp; \
+    tmp = sign##int32_to_##float##fsz ((itype##_t)x, &env->vfp.fp_status); \
+    return float##fsz##_scalbn(tmp, -(int)shift, &env->vfp.fp_status); \
 } \
-ftype VFP_HELPER(to##name, p)(ftype x, uint32_t shift, CPUState *env) \
+uint##fsz##_t VFP_HELPER(to##name, p)(float##fsz x, uint32_t shift, \
+                                      CPUState *env) \
 { \
-    ftype tmp; \
-    if (ftype##_is_any_nan(x)) { \
-        return ftype##_zero; \
+    float##fsz tmp; \
+    if (float##fsz##_is_any_nan(x)) { \
+        return 0; \
     } \
-    tmp = ftype##_scalbn(x, shift, &env->vfp.fp_status); \
-    return vfp_ito##p(ftype##_to_##itype##_round_to_zero(tmp, \
-        &env->vfp.fp_status)); \
+    tmp = float##fsz##_scalbn(x, shift, &env->vfp.fp_status); \
+    return float##fsz##_to_##itype##_round_to_zero(tmp, &env->vfp.fp_status); \
 }
 
-VFP_CONV_FIX(sh, d, float64, int16, )
-VFP_CONV_FIX(sl, d, float64, int32, )
-VFP_CONV_FIX(uh, d, float64, uint16, u)
-VFP_CONV_FIX(ul, d, float64, uint32, u)
-VFP_CONV_FIX(sh, s, float32, int16, )
-VFP_CONV_FIX(sl, s, float32, int32, )
-VFP_CONV_FIX(uh, s, float32, uint16, u)
-VFP_CONV_FIX(ul, s, float32, uint32, u)
+VFP_CONV_FIX(sh, d, 64, int16, )
+VFP_CONV_FIX(sl, d, 64, int32, )
+VFP_CONV_FIX(uh, d, 64, uint16, u)
+VFP_CONV_FIX(ul, d, 64, uint32, u)
+VFP_CONV_FIX(sh, s, 32, int16, )
+VFP_CONV_FIX(sl, s, 32, int32, )
+VFP_CONV_FIX(uh, s, 32, uint16, u)
+VFP_CONV_FIX(ul, s, 32, uint32, u)
 #undef VFP_CONV_FIX
 
 /* Half precision conversions.  */
+static float32 do_fcvt_f16_to_f32(uint32_t a, CPUState *env, float_status *s)
+{
+    int ieee = (env->vfp.xregs[ARM_VFP_FPSCR] & (1 << 26)) == 0;
+    float32 r = float16_to_float32(make_float16(a), ieee, s);
+    if (ieee) {
+        return float32_maybe_silence_nan(r);
+    }
+    return r;
+}
+
+static uint32_t do_fcvt_f32_to_f16(float32 a, CPUState *env, float_status *s)
+{
+    int ieee = (env->vfp.xregs[ARM_VFP_FPSCR] & (1 << 26)) == 0;
+    float16 r = float32_to_float16(a, ieee, s);
+    if (ieee) {
+        r = float16_maybe_silence_nan(r);
+    }
+    return float16_val(r);
+}
+
+float32 HELPER(neon_fcvt_f16_to_f32)(uint32_t a, CPUState *env)
+{
+    return do_fcvt_f16_to_f32(a, env, &env->vfp.standard_fp_status);
+}
+
+uint32_t HELPER(neon_fcvt_f32_to_f16)(float32 a, CPUState *env)
+{
+    return do_fcvt_f32_to_f16(a, env, &env->vfp.standard_fp_status);
+}
+
 float32 HELPER(vfp_fcvt_f16_to_f32)(uint32_t a, CPUState *env)
 {
-    float_status *s = &env->vfp.fp_status;
-    int ieee = (env->vfp.xregs[ARM_VFP_FPSCR] & (1 << 26)) == 0;
-    return float16_to_float32(a, ieee, s);
+    return do_fcvt_f16_to_f32(a, env, &env->vfp.fp_status);
 }
 
 uint32_t HELPER(vfp_fcvt_f32_to_f16)(float32 a, CPUState *env)
 {
-    float_status *s = &env->vfp.fp_status;
-    int ieee = (env->vfp.xregs[ARM_VFP_FPSCR] & (1 << 26)) == 0;
-    return float32_to_float16(a, ieee, s);
+    return do_fcvt_f32_to_f16(a, env, &env->vfp.fp_status);
 }
+
+#define float32_two make_float32(0x40000000)
+#define float32_three make_float32(0x40400000)
+#define float32_one_point_five make_float32(0x3fc00000)
 
 float32 HELPER(recps_f32)(float32 a, float32 b, CPUState *env)
 {
-    float_status *s = &env->vfp.fp_status;
-    float32 two = int32_to_float32(2, s);
-    return float32_sub(two, float32_mul(a, b, s), s);
+    float_status *s = &env->vfp.standard_fp_status;
+    if ((float32_is_infinity(a) && float32_is_zero_or_denormal(b)) ||
+        (float32_is_infinity(b) && float32_is_zero_or_denormal(a))) {
+        return float32_two;
+    }
+    return float32_sub(float32_two, float32_mul(a, b, s), s);
 }
 
 float32 HELPER(rsqrts_f32)(float32 a, float32 b, CPUState *env)
 {
     float_status *s = &env->vfp.standard_fp_status;
-    float32 two = int32_to_float32(2, s);
-    float32 three = int32_to_float32(3, s);
     float32 product;
     if ((float32_is_infinity(a) && float32_is_zero_or_denormal(b)) ||
         (float32_is_infinity(b) && float32_is_zero_or_denormal(a))) {
-        product = float32_zero;
-    } else {
-        product = float32_mul(a, b, s);
+        return float32_one_point_five;
     }
-    return float32_div(float32_sub(three, product, s), two, s);
+    product = float32_mul(a, b, s);
+    return float32_div(float32_sub(float32_three, product, s), float32_two, s);
 }
 
 /* NEON helpers.  */
 
-/* TODO: The architecture specifies the value that the estimate functions
-   should return.  We return the exact reciprocal/root instead.  */
+/* Constants 256 and 512 are used in some helpers; we avoid relying on
+ * int->float conversions at run-time.  */
+#define float64_256 make_float64(0x4070000000000000LL)
+#define float64_512 make_float64(0x4080000000000000LL)
+
+/* The algorithm that must be used to calculate the estimate
+ * is specified by the ARM ARM.
+ */
+static float64 recip_estimate(float64 a, CPUState *env)
+{
+    float_status *s = &env->vfp.standard_fp_status;
+    /* q = (int)(a * 512.0) */
+    float64 q = float64_mul(float64_512, a, s);
+    int64_t q_int = float64_to_int64_round_to_zero(q, s);
+
+    /* r = 1.0 / (((double)q + 0.5) / 512.0) */
+    q = int64_to_float64(q_int, s);
+    q = float64_add(q, float64_half, s);
+    q = float64_div(q, float64_512, s);
+    q = float64_div(float64_one, q, s);
+
+    /* s = (int)(256.0 * r + 0.5) */
+    q = float64_mul(q, float64_256, s);
+    q = float64_add(q, float64_half, s);
+    q_int = float64_to_int64_round_to_zero(q, s);
+
+    /* return (double)s / 256.0 */
+    return float64_div(int64_to_float64(q_int, s), float64_256, s);
+}
+
 float32 HELPER(recpe_f32)(float32 a, CPUState *env)
 {
-    float_status *s = &env->vfp.fp_status;
-    float32 one = int32_to_float32(1, s);
-    return float32_div(one, a, s);
+    float_status *s = &env->vfp.standard_fp_status;
+    float64 f64;
+    uint32_t val32 = float32_val(a);
+
+    int result_exp;
+    int a_exp = (val32  & 0x7f800000) >> 23;
+    int sign = val32 & 0x80000000;
+
+    if (float32_is_any_nan(a)) {
+        if (float32_is_signaling_nan(a)) {
+            float_raise(float_flag_invalid, s);
+        }
+        return float32_default_nan;
+    } else if (float32_is_infinity(a)) {
+        return float32_set_sign(float32_zero, float32_is_neg(a));
+    } else if (float32_is_zero_or_denormal(a)) {
+        float_raise(float_flag_divbyzero, s);
+        return float32_set_sign(float32_infinity, float32_is_neg(a));
+    } else if (a_exp >= 253) {
+        float_raise(float_flag_underflow, s);
+        return float32_set_sign(float32_zero, float32_is_neg(a));
+    }
+
+    f64 = make_float64((0x3feULL << 52)
+                       | ((int64_t)(val32 & 0x7fffff) << 29));
+
+    result_exp = 253 - a_exp;
+
+    f64 = recip_estimate(f64, env);
+
+    val32 = sign
+        | ((result_exp & 0xff) << 23)
+        | ((float64_val(f64) >> 29) & 0x7fffff);
+    return make_float32(val32);
+}
+
+/* The algorithm that must be used to calculate the estimate
+ * is specified by the ARM ARM.
+ */
+static float64 recip_sqrt_estimate(float64 a, CPUState *env)
+{
+    float_status *s = &env->vfp.standard_fp_status;
+    float64 q;
+    int64_t q_int;
+
+    if (float64_lt(a, float64_half, s)) {
+        /* range 0.25 <= a < 0.5 */
+
+        /* a in units of 1/512 rounded down */
+        /* q0 = (int)(a * 512.0);  */
+        q = float64_mul(float64_512, a, s);
+        q_int = float64_to_int64_round_to_zero(q, s);
+
+        /* reciprocal root r */
+        /* r = 1.0 / sqrt(((double)q0 + 0.5) / 512.0);  */
+        q = int64_to_float64(q_int, s);
+        q = float64_add(q, float64_half, s);
+        q = float64_div(q, float64_512, s);
+        q = float64_sqrt(q, s);
+        q = float64_div(float64_one, q, s);
+    } else {
+        /* range 0.5 <= a < 1.0 */
+
+        /* a in units of 1/256 rounded down */
+        /* q1 = (int)(a * 256.0); */
+        q = float64_mul(float64_256, a, s);
+        int64_t q_int = float64_to_int64_round_to_zero(q, s);
+
+        /* reciprocal root r */
+        /* r = 1.0 /sqrt(((double)q1 + 0.5) / 256); */
+        q = int64_to_float64(q_int, s);
+        q = float64_add(q, float64_half, s);
+        q = float64_div(q, float64_256, s);
+        q = float64_sqrt(q, s);
+        q = float64_div(float64_one, q, s);
+    }
+    /* r in units of 1/256 rounded to nearest */
+    /* s = (int)(256.0 * r + 0.5); */
+
+    q = float64_mul(q, float64_256,s );
+    q = float64_add(q, float64_half, s);
+    q_int = float64_to_int64_round_to_zero(q, s);
+
+    /* return (double)s / 256.0;*/
+    return float64_div(int64_to_float64(q_int, s), float64_256, s);
 }
 
 float32 HELPER(rsqrte_f32)(float32 a, CPUState *env)
 {
-    float_status *s = &env->vfp.fp_status;
-    float32 one = int32_to_float32(1, s);
-    return float32_div(one, float32_sqrt(a, s), s);
+    float_status *s = &env->vfp.standard_fp_status;
+    int result_exp;
+    float64 f64;
+    uint32_t val;
+    uint64_t val64;
+
+    val = float32_val(a);
+
+    if (float32_is_any_nan(a)) {
+        if (float32_is_signaling_nan(a)) {
+            float_raise(float_flag_invalid, s);
+        }
+        return float32_default_nan;
+    } else if (float32_is_zero_or_denormal(a)) {
+        float_raise(float_flag_divbyzero, s);
+        return float32_set_sign(float32_infinity, float32_is_neg(a));
+    } else if (float32_is_neg(a)) {
+        float_raise(float_flag_invalid, s);
+        return float32_default_nan;
+    } else if (float32_is_infinity(a)) {
+        return float32_zero;
+    }
+
+    /* Normalize to a double-precision value between 0.25 and 1.0,
+     * preserving the parity of the exponent.  */
+    if ((val & 0x800000) == 0) {
+        f64 = make_float64(((uint64_t)(val & 0x80000000) << 32)
+                           | (0x3feULL << 52)
+                           | ((uint64_t)(val & 0x7fffff) << 29));
+    } else {
+        f64 = make_float64(((uint64_t)(val & 0x80000000) << 32)
+                           | (0x3fdULL << 52)
+                           | ((uint64_t)(val & 0x7fffff) << 29));
+    }
+
+    result_exp = (380 - ((val & 0x7f800000) >> 23)) / 2;
+
+    f64 = recip_sqrt_estimate(f64, env);
+
+    val64 = float64_val(f64);
+
+    val = ((val64 >> 63)  & 0x80000000)
+        | ((result_exp & 0xff) << 23)
+        | ((val64 >> 29)  & 0x7fffff);
+    return make_float32(val);
 }
 
 uint32_t HELPER(recpe_u32)(uint32_t a, CPUState *env)
 {
-    float_status *s = &env->vfp.fp_status;
-    float32 tmp;
-    tmp = int32_to_float32(a, s);
-    tmp = float32_scalbn(tmp, -32, s);
-    tmp = helper_recpe_f32(tmp, env);
-    tmp = float32_scalbn(tmp, 31, s);
-    return float32_to_int32(tmp, s);
+    float64 f64;
+
+    if ((a & 0x80000000) == 0) {
+        return 0xffffffff;
+    }
+
+    f64 = make_float64((0x3feULL << 52)
+                       | ((int64_t)(a & 0x7fffffff) << 21));
+
+    f64 = recip_estimate (f64, env);
+
+    return 0x80000000 | ((float64_val(f64) >> 21) & 0x7fffffff);
 }
 
 uint32_t HELPER(rsqrte_u32)(uint32_t a, CPUState *env)
 {
-    float_status *s = &env->vfp.fp_status;
-    float32 tmp;
-    tmp = int32_to_float32(a, s);
-    tmp = float32_scalbn(tmp, -32, s);
-    tmp = helper_rsqrte_f32(tmp, env);
-    tmp = float32_scalbn(tmp, 31, s);
-    return float32_to_int32(tmp, s);
+    float64 f64;
+
+    if ((a & 0xc0000000) == 0) {
+        return 0xffffffff;
+    }
+
+    if (a & 0x80000000) {
+        f64 = make_float64((0x3feULL << 52)
+                           | ((uint64_t)(a & 0x7fffffff) << 21));
+    } else { /* bits 31-30 == '01' */
+        f64 = make_float64((0x3fdULL << 52)
+                           | ((uint64_t)(a & 0x3fffffff) << 22));
+    }
+
+    f64 = recip_sqrt_estimate(f64, env);
+
+    return 0x80000000 | ((float64_val(f64) >> 21) & 0x7fffffff);
 }
 
 void HELPER(set_teecr)(CPUState *env, uint32_t val)
